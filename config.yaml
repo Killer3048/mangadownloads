@@ -1,5 +1,5 @@
 download_dir: "Downloads"
-proxy: "http://user175617:ouep96@45.93.82.211:4217"
+proxy: ""
 timeout_connect: 15
 timeout_read: 30
 retries: 5
