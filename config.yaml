@@ -11,7 +11,7 @@ headless: true
 # Folder to store browser profile (cookies, localStorage, sessionStorage, indexedDB, cache)
 naver_user_data_dir: "naver_profile"
 # Time in seconds to wait for manual login on first run
-naver_login_timeout: 120
+naver_login_timeout: 1560
 
 
 urls:
