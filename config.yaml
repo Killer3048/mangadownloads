@@ -1,0 +1,30 @@
+download_dir: "Downloads"
+proxy: "http://user175617:ouep96@45.93.82.211:4217"
+timeout_connect: 15
+timeout_read: 30
+retries: 5
+max_concurrent_chapters: 5
+use_proxy_for_browser: false
+headless: true
+
+# Naver session persistence
+# Folder to store browser profile (cookies, localStorage, sessionStorage, indexedDB, cache)
+naver_user_data_dir: "naver_profile"
+# Time in seconds to wait for manual login on first run
+naver_login_timeout: 120
+
+
+urls:
+  # Mangalib example
+  # - "https://mangalib.me/ru/80583--wo-zhen-bu-shi-xie-shen-zou-gou/read/v1/c167"
+  # Naver Comic example
+  - https://comic.naver.com/webtoon/detail?titleId=751168&no=239&week=fri
+  - https://comic.naver.com/webtoon/detail?titleId=751168&no=240&week=fri
+  
+  # DemonicScans example
+  # - "https://demonicscans.org/title/The-Constellation-That-Returned-From-Hell/chapter/184"
+
+  # Webtoons example
+  # - "https://www.webtoons.com/en/fantasy/the-luckiest-mage/episode-1/viewer?title_no=9174&episode_no=1"
+  # - "https://www.webtoons.com/en/fantasy/the-luckiest-mage/episode-2/viewer?title_no=9174&episode_no=2"
+  # - "https://www.webtoons.com/en/fantasy/the-luckiest-mage/episode-3/viewer?title_no=9174&episode_no=3"
