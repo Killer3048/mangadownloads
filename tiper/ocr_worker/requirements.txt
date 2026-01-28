@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+paddleocr
+# Install `paddlepaddle` / `paddlepaddle-gpu` separately depending on your OS/CUDA.
+

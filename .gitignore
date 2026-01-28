@@ -1,0 +1,76 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+**/.venv/
+**/venv/
+
+# Node
+node_modules/
+**/node_modules/
+.npm-cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Env files (secrets)
+.env
+.env.*
+!.env.example
+
+# Runtime outputs
+tiper/jobs/
+tiper/output/
+
+# Models: keep only bubble detector in git
+tiper/models/*
+!tiper/models/speech-bubble-yolo8m/
+!tiper/models/speech-bubble-yolo8m/**
+
+# Model weights (ignore all; allow bubble detector below)
+**/*.pt
+**/*.ckpt
+**/*.pth
+**/*.onnx
+**/*.safetensors
+**/*.pdmodel
+**/*.pdiparams
+**/*.pdparams
+**/*.params
+
+# But keep its local caches out of git
+tiper/models/speech-bubble-yolo8m/.cache/
+
+# Scanr
+scanr/app
+scanr/storage
+scanr/TypeR*.zip
+scanr/TypeR-*.zxp
+scanr/docs*
+scanr/bubble_detector/models/*.pt
+
+
+/*.png
+/*.jpg
+/*.md
+scan_artefacts
+script/scan_*.py
+test/
+manga-test/

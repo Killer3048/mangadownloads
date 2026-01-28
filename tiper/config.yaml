@@ -1,0 +1,88 @@
+# Global Settings
+image_path: "chapters/ch166/ch166_original.png" # Path to the input image (can be overridden)
+output_dir: "output" # Directory to save results
+
+# Cutting Settings
+cutting:
+  min_height: 1000
+  max_height: 4000
+  det_chunk_height: 4096
+  det_overlap: 256
+  model: "./yolo11x.pt"
+  imgsz: 1280
+  conf: 0.25
+  margin: 20
+  device: "auto"
+  use_text_detection: true
+  text_langs: ["ru", "en", "ko"]
+  text_conf: 0.40
+  text_min_box_width: 20
+  text_min_box_height: 20
+  text_chunk_height: null
+  text_overlap: null
+  drop_linux_caches: false
+  weights:
+    edge_score: 1.0
+    variance_score: 0.5
+    gradient_score: 0.5
+    white_space_score: 2.0
+    distance_penalty: 0.00001
+
+# Blaster Settings
+blaster:
+  confidence: 0.142           # Primary OCR confidence threshold
+  languages: ["ko", "en"]    # Primary languages to detect
+  device: "cuda"             # or "cpu"
+  dilate_size: 5             # Dilation for the mask to cover edges
+  debug: false                # Save debug images (masks, boxes)
+  bubble_model_path: "models/yolov8m_seg-speech-bubble/model.pt"
+  bubble_confidence: 0.7
+  
+  secondary_pass:
+    enabled: true
+    language: "th"
+    confidence: 0.15 # if original - eng; threshold - 0.16 | if korean - 0.15
+
+# Bubble class classification (auto-translate step 3)
+bubble_class:
+  enabled: true
+  model_path: "models/yolo11m-bubbles-cls/best.pt"
+  conf: 0.6
+  imgsz: null
+  device: "auto"
+
+# Batch Processing Settings
+batch:
+  enabled: true                    # Enable batch processing mode
+  chapters_dir: "chapters"         # Directory containing chapter folders
+  chapter_pattern: "ch*,chapter*"  # Glob patterns to match chapter folders (comma-separated)
+  cleanup_artifacts: true          # Delete slices/ and debug/ after processing each chapter
+  start_from: null                 # Optional: start from chapter number (e.g., 166)
+  stop_at: null                    # Optional: stop at chapter number (e.g., 170)
+
+# Frames Slicing Settings (Secondary Pass)
+frames:
+  enabled: true                    # Enable secondary frames slicing
+  min_height: 4000                 # Minimum frame height
+  max_height: 7800                 # Maximum frame height
+  output_subdir: "frames"          # Subdirectory name for frames output
+  format: "png"                    # Output format: png or jpg
+  quality: 95                      # JPEG quality (if format is jpg)
+
+# AutoFit Settings (autotranslate text sizing)
+autofit:
+  use_adaptive_fit: true           # false = legacy fixed -4pt reduction
+  
+  adaptive_slack:
+    # Shape thresholds (core_area / bubble_area)
+    elliptical_threshold: 0.4      # shape_factor < 0.4 = elliptical/complex
+    moderate_threshold: 0.6        # 0.4-0.6 = moderate shape
+    
+    # Target slack percentages for each shape type
+    elliptical_slack: 0.15         # 15% margin for elliptical bubbles
+    moderate_slack: 0.12           # 12% margin for moderate shapes
+    rectangular_slack: 0.10        # 10% margin for rectangular bubbles
+    
+    # Iteration limits
+    max_reduction_pt: 8            # Maximum reduction from best_pt
+    pt_step: 2                     # Font size step for iteration
