@@ -12,3 +12,9 @@ xai:
   # How long to keep retrying on 429 (high demand / rate limit) before failing the ROI.
   max_429_wait_sec: 300
   timeout_sec: 120
+  # TLS verification for calling api.x.ai.
+  # - true: verify TLS certificates (recommended)
+  # - false: disable verification (INSECURE; only use for troubleshooting)
+  # If you have CA issues, you can force a specific CA bundle:
+  # tls_ca_bundle: certifi
+  tls_verify: true
