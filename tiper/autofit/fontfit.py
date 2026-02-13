@@ -343,6 +343,40 @@ def _inset_bbox(bbox: Tuple[float, float, float, float], inset_x: float, inset_y
   return (nx1, ny1, nx2, ny2)
 
 
+def _relax_fallback_clamp_for_short_text(
+  clamp_bbox: Tuple[float, float, float, float],
+  *,
+  core_bbox: Tuple[float, float, float, float],
+  geom_item: Dict[str, Any],
+  ocr_item: Dict[str, Any],
+  text: str,
+) -> Tuple[float, float, float, float]:
+  src = str((geom_item or {}).get("source") or "").lower()
+  fallback = (not src) or src.startswith("bbox_fallback")
+  if not fallback:
+    return clamp_bbox
+
+  words = len(_tokenize_ws(text))
+  try:
+    lc = int((ocr_item or {}).get("line_count") or 0)
+  except Exception:
+    lc = 0
+
+  # For short lines in bbox-fallback mode, comfort clamp is often too narrow.
+  # Slightly expand it back toward core bbox.
+  relax = 1.0
+  if lc <= 1:
+    relax = 1.14
+  elif words <= 4:
+    relax = 1.10
+  elif words <= 7:
+    relax = 1.06
+  if relax <= 1.0:
+    return clamp_bbox
+
+  return _clamp_bbox(_expand_bbox_about_center(clamp_bbox, scale=float(relax)), core_bbox)
+
+
 def _comfort_clamp_bbox(
   core_bbox: Tuple[float, float, float, float],
   *,
@@ -2068,6 +2102,8 @@ def compute_fit_map(
     if not isinstance(g, dict):
       g = {}
     core_bb = _bbox_tuple(g.get("core_bbox") or {}) or bubble_bb
+    src = str(g.get("source") or "").lower()
+    fallback_src = (not src) or src.startswith("bbox_fallback")
     class_info = {}
     if isinstance(bubble_classes, dict):
       maybe_info = bubble_classes.get(bid) or {}
@@ -2084,8 +2120,20 @@ def compute_fit_map(
     )
 
     o = ocr_items.get(bid) or {}
-    ocr_bb = _bbox_tuple(o.get("ocr_bbox") or {}) or core_bb
     cov = _safe_float(o.get("cov", 0.0), 0.0)
+    text_word_count = len(_tokenize_ws(text))
+    try:
+      ocr_line_count = int(o.get("line_count") or 0) if isinstance(o, dict) else 0
+    except Exception:
+      ocr_line_count = 0
+
+    # In bbox-fallback mode, core bbox can be overly conservative for short lines.
+    # Slightly expand toward the bubble bbox to restore usable width.
+    core_fit_bb = core_bb
+    if fallback_src and (ocr_line_count <= 1 or text_word_count <= 3):
+      core_fit_bb = _clamp_bbox(_expand_bbox_about_center(core_bb, scale=1.14), bubble_bb)
+
+    ocr_bb = _bbox_tuple(o.get("ocr_bbox") or {}) or core_fit_bb
     if cov < 0.08:
       scale = 1.60
     elif cov < 0.18:
@@ -2093,7 +2141,14 @@ def compute_fit_map(
     else:
       scale = 1.20
 
-    clamp_bb = _comfort_clamp_bbox(core_bb, cov=cov, ocr_item=o if isinstance(o, dict) else {}, geom_item=g if isinstance(g, dict) else {}, config=config)
+    clamp_bb = _comfort_clamp_bbox(core_fit_bb, cov=cov, ocr_item=o if isinstance(o, dict) else {}, geom_item=g if isinstance(g, dict) else {}, config=config)
+    clamp_bb = _relax_fallback_clamp_for_short_text(
+      clamp_bb,
+      core_bbox=core_fit_bb,
+      geom_item=g if isinstance(g, dict) else {},
+      ocr_item=o if isinstance(o, dict) else {},
+      text=text,
+    )
     layout = _clamp_bbox(_expand_bbox_about_center(ocr_bb, scale=scale), clamp_bb)
     cur = layout
     chosen_layout = layout
@@ -2145,7 +2200,6 @@ def compute_fit_map(
         max_reduce = 0
       layout_badness_weight = max(0.0, min(4.0, float(layout_badness_weight)))
       hyphen_util_penalty = max(0.0, min(8.0, float(hyphen_util_penalty)))
-      text_word_count = len(_tokenize_ws(text))
       if text_word_count <= 2:
         hyphen_util_penalty *= 0.35
       elif text_word_count <= 4:
@@ -2160,16 +2214,20 @@ def compute_fit_map(
       elif cov < 0.30:
         target += 0.005
 
-      try:
-        lc = int(o.get("line_count") or 0) if isinstance(o, dict) else 0
-      except Exception:
-        lc = 0
+      lc = int(ocr_line_count)
       if lc >= 4:
         target -= 0.01
-
-      src = str(g.get("source") or "").lower()
-      if (not src) or src.startswith("bbox_fallback"):
+      elif lc <= 1:
         target -= 0.015
+
+      if fallback_src:
+        target -= 0.015
+
+      # Short phrases can look much better with a larger optical size.
+      if text_word_count <= 3:
+        target -= 0.01
+      elif text_word_count <= 6:
+        target -= 0.005
 
       target = max(0.03, min(0.14, float(target)))
 

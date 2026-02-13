@@ -167,7 +167,7 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
     "autofit": {
       "enabled": True,
       "min_pt": 16,
-      "max_pt": 34,
+      "max_pt": 52,
       # Font size search step (pt). For comics typography a 2pt step is usually enough and avoids jitter.
       "pt_step": 2,
       # Photoshop document resolution (DPI). UI sends it at job creation; fallback to 72 if missing.
