@@ -190,11 +190,14 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
         "max_frac": 0.22,
         "min_px": 4,
         "max_px": 60,
-        "fallback_bonus": 0.10,
+        "fallback_bonus": 0.08,
         # Desired minimal leftover space (ratio) inside the fit box.
-        "target_slack": 0.08,
+        "target_slack": 0.06,
+        # Utility term weights for selecting a readable layout among fit candidates.
+        "layout_badness_weight": 0.7,
+        "hyphen_util_penalty": 2.4,
         # Limit how much we can reduce the chosen font size for comfort.
-        "max_reduce_pt": 6,
+        "max_reduce_pt": 4,
       },
       # Auto line-breaking rules ("komponovka.md"). When enabled, server may return
       # translation text with explicit '\n' line breaks to improve readability.
@@ -203,6 +206,16 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
         "mode": "auto",  # auto|force|off
         "lang": "auto",  # auto|ru|en
         "apply_to_translation": True,
+        # Generic profile fallback. Per-bubble profile is inferred from bubble
+        # class + geometry and blended with these values.
+        "profile": {
+          "alpha": 0.78,
+          "min_factor": 0.64,
+          "line_break_penalty": 0.42,
+          "shape_penalty": 1.8,
+          "center_peak_penalty": 1.6,
+          "hyphen_break_penalty": 4.0,
+        },
       },
     },
   }

@@ -20,7 +20,7 @@ class AtomicToken:
     self.penalty = penalty
     self.join_char = join_char # Character to effectively add if we break here (e.g. "-")
 
-def _tokenize_atomic(text: str, lang: str) -> List[AtomicToken]:
+def _tokenize_atomic(text: str, lang: str, *, allow_auto_hyphen: bool = True) -> List[AtomicToken]:
   """
   Splits text into atomic units (syllables or words).
   Returns sequence of tokens.
@@ -36,12 +36,16 @@ def _tokenize_atomic(text: str, lang: str) -> List[AtomicToken]:
   raw_words = _tokenize_ws(text)
   out: List[AtomicToken] = []
   
-  import pyphen
   dic = None
-  try:
+  if allow_auto_hyphen:
+    try:
+      import pyphen
+
       py_lang = "ru_RU" if lang == "ru" else ("en_US" if lang == "en" else None)
-      if py_lang: dic = pyphen.Pyphen(lang=py_lang)
-  except: pass
+      if py_lang:
+        dic = pyphen.Pyphen(lang=py_lang)
+    except Exception:
+      dic = None
 
   for i, word in enumerate(raw_words):
       # Is this the last word?
@@ -169,19 +173,23 @@ def _split_word_preserving_hyphens(word: str) -> List[Tuple[str, Optional[str]]]
 
   return segments
 
-def _tokenize_atomic(text: str, lang: str) -> List[AtomicToken]:
+def _tokenize_atomic(text: str, lang: str, *, allow_auto_hyphen: bool = True) -> List[AtomicToken]:
   """
   Splits text into atomic units (syllables or words).
   """
   raw_words = _tokenize_ws(text)
   out: List[AtomicToken] = []
   
-  import pyphen
   dic = None
-  try:
+  if allow_auto_hyphen:
+    try:
+      import pyphen
+
       py_lang = "ru_RU" if lang == "ru" else ("en_US" if lang == "en" else None)
-      if py_lang: dic = pyphen.Pyphen(lang=py_lang)
-  except: pass
+      if py_lang:
+        dic = pyphen.Pyphen(lang=py_lang)
+    except Exception:
+      dic = None
 
   for i, word in enumerate(raw_words):
       is_last_word = (i == len(raw_words) - 1)
@@ -195,16 +203,46 @@ def _tokenize_atomic(text: str, lang: str) -> List[AtomicToken]:
       if not segments:
         continue
 
-      for seg_text, join_after in segments:
-        syllables = []
-        if dic and len(seg_text) > 4:
+      # If a token already has explicit hyphen(s), avoid additional pyphen
+      # splitting inside the same token: this prevents awkward forms like
+      # "С-се-\nстра".
+      has_explicit_hyphen = len(segments) > 1
+      explicit_tail_split = False
+      if has_explicit_hyphen and len(segments) == 2:
+        head_norm = _tok_norm(segments[0][0])
+        tail_norm = _tok_norm(segments[1][0])
+        # Allow split in the tail for stutter-like forms ("С-сестра"),
+        # otherwise we lose too much font size in tiny bubbles.
+        if len(head_norm) <= 2 and len(tail_norm) >= 6:
+          explicit_tail_split = True
+
+      for seg_idx, (seg_text, join_after) in enumerate(segments):
+        allow_seg_pyphen = (not has_explicit_hyphen) or (explicit_tail_split and seg_idx == 1 and not join_after)
+        # Split punctuation from the core token before pyphenation.
+        lead = ""
+        core = seg_text
+        trail = ""
+        m = re.match(r"^([\\(\\[«“\"']*)(.*?)([\\)\\]»”\"'.,:;!?…]*)$", seg_text)
+        if m:
+          lead = m.group(1) or ""
+          core = m.group(2) or ""
+          trail = m.group(3) or ""
+
+        syllables: List[str] = []
+        if dic and allow_seg_pyphen and len(core) > 6:
           # pyphen inserter returns "syl-la-ble"
-          inserted = dic.inserted(seg_text)
+          inserted = dic.inserted(core)
           if "-" in inserted:
-            syllables = inserted.split("-")
+            syllables = [s for s in inserted.split("-") if s]
 
         if not syllables:
-          syllables = [seg_text]
+          base = core if core else seg_text
+          syllables = [base]
+
+        if lead:
+          syllables[0] = lead + syllables[0]
+        if trail:
+          syllables[-1] = syllables[-1] + trail
 
         for j, syl in enumerate(syllables):
           is_last_syl = (j == len(syllables) - 1)
@@ -212,7 +250,7 @@ def _tokenize_atomic(text: str, lang: str) -> List[AtomicToken]:
           if is_last_syl:
             if join_after:
               # Explicit hyphen in the original text: preserve it both on continue and on break.
-              out.append(AtomicToken(syl, True, 10.0, join_char="", join_break=join_after, join_cont=join_after))
+              out.append(AtomicToken(syl, True, 6.0, join_char="", join_break=join_after, join_cont=join_after))
             else:
               # End of word.
               # If break: implies newline (no extra char).
@@ -222,7 +260,14 @@ def _tokenize_atomic(text: str, lang: str) -> List[AtomicToken]:
           else:
             # Mid-word syllable.
             # If break: add HYPHEN. If continue: add nothing (join parts).
-            out.append(AtomicToken(syl, True, 10.0, join_char="", join_break="-", join_cont=""))
+            # Penalize very short fragments much harder to avoid unnatural hyphenation.
+            rem = "".join(syllables[j + 1 :])
+            pen = 14.0
+            if len(syl) <= 2 or len(rem) <= 2:
+              pen += 20.0
+            elif len(syl) <= 3 or len(rem) <= 3:
+              pen += 10.0
+            out.append(AtomicToken(syl, True, pen, join_char="", join_break="-", join_cont=""))
               
   return out
 
@@ -327,8 +372,7 @@ def _comfort_clamp_bbox(
   min_frac = _safe_float(ccfg.get("min_frac", 0.06), 0.06)
   max_frac = _safe_float(ccfg.get("max_frac", 0.22), 0.22)
   # Extra shrink when we don't have a true contour-based core bbox (bbox fallback).
-  # Empirically many bubbles then produce text that visually hugs the contour, so we
-  # shrink a bit more by default.
+  # Keep this adaptive: fixed heavy bonus makes fonts too small on many real pages.
   fallback_bonus = _safe_float(ccfg.get("fallback_bonus", 0.10), 0.10)
   min_px = int(ccfg.get("min_px", 4))
   max_px = int(ccfg.get("max_px", 60))
@@ -350,10 +394,28 @@ def _comfort_clamp_bbox(
     elif cov_f < 0.30:
       frac += 0.02
 
-  # More margin when we have no segmentation core (bbox fallback tends to include tails).
+  # More margin when we have no segmentation core (bbox fallback tends to include tails),
+  # but scale it down when OCR coverage is decent.
   src = str(geom_item.get("source") or "").lower()
   if (not src) or src.startswith("bbox_fallback"):
-    frac += float(fallback_bonus)
+    fb = float(fallback_bonus)
+    if cov_f is not None:
+      if cov_f >= 0.30:
+        fb *= 0.20
+      elif cov_f >= 0.20:
+        fb *= 0.35
+      elif cov_f >= 0.12:
+        fb *= 0.55
+      else:
+        fb *= 0.80
+    frac += fb
+
+  # When OCR takes significant area, keep more usable box to avoid unnecessary downscaling.
+  if cov_f is not None:
+    if cov_f >= 0.18:
+      frac -= 0.02
+    if cov_f >= 0.28:
+      frac -= 0.01
 
   # If OCR already produced many lines, shrinking too much tends to over-reduce font size.
   try:
@@ -436,7 +498,7 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
             pos = 0
             for chunk in inserted.split("-")[:-1]:
               pos += len(chunk)
-              if 2 <= pos <= len(w) - 2:
+              if 3 <= pos <= len(w) - 3:
                 idxs.append(pos)
             return idxs
       except Exception:
@@ -446,7 +508,7 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
       if lang == "ru":
         vowels = set("аеёиоуыэюяАЕЁИОУЫЭЮЯ")
         idxs = []
-        for i in range(2, len(w) - 2):
+        for i in range(3, len(w) - 3):
           if w[i - 1] in vowels and w[i] not in vowels:
             idxs.append(i)
         return idxs
@@ -461,10 +523,10 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
           best_cut = cut
       if best_cut is None:
         # Fallback: character split.
-        cut = max(2, min(len(remainder) - 2, int(len(remainder) * 0.5)))
-        while cut > 2 and _text_width(remainder[:cut] + "-", font) > max_width:
+        cut = max(3, min(len(remainder) - 3, int(len(remainder) * 0.5)))
+        while cut > 3 and _text_width(remainder[:cut] + "-", font) > max_width:
           cut -= 1
-        best_cut = max(2, cut)
+        best_cut = max(3, cut)
 
       parts.append(remainder[:best_cut] + "-")
       remainder = remainder[best_cut:]
@@ -813,31 +875,29 @@ def _punct_break_bonus(last_tok: str) -> float:
   return 0.0
 
 
-def _get_shape_factor(line_idx: int, total_lines: int) -> float:
+def _get_shape_factor(
+  line_idx: int,
+  total_lines: int,
+  *,
+  alpha: float = 0.75,
+  min_factor: float = 0.66,
+) -> float:
   """
-  Returns a width factor (0.0 to 1.0) for a given line index in an oval/diamond profile.
+  Returns a width factor (0..1) for a given line index.
+  alpha controls tapering (higher => stronger narrow-wide-narrow profile).
+  min_factor prevents overly narrow top/bottom lines.
   """
   if total_lines <= 1:
     return 1.0
-  
-  # Normalized Y center of the line.
-  # 0 to 1 range.
+
+  a = max(0.0, min(0.95, float(alpha)))
+  mn = max(0.45, min(1.0, float(min_factor)))
+
   y_rel = (float(line_idx) + 0.5) / float(total_lines)
-  
-  # Map to -1 to 1
   y_norm = (y_rel - 0.5) * 2.0
-  
-  # Ellipse equation: x^2 + y^2 = 1 => x = sqrt(1 - y^2)
-  # We clamp the curve so it doesn't go to 0 width.
-  # Let's say min width is 65% at the tips.
-  # effective y range: if we use full -1..1, we get 0 width.
-  # let's assume the text box is inscribed in approx 85% of the height of the ellipse?
-  # or simply: width = max_width * sqrt(1 - (alpha * y)^2)
-  alpha = 0.75 # at y=1, alpha*y = 0.75, width = sqrt(1 - 0.5625) = 0.66
-  
-  val = 1.0 - (alpha * y_norm) ** 2
-  if val < 0: return 0.5 # Should not happen with alpha < 1
-  return math.sqrt(val)
+  val = 1.0 - (a * y_norm) ** 2
+  f = math.sqrt(max(0.0, float(val)))
+  return max(mn, min(1.0, float(f)))
 
 
 def _estimate_max_lines(font: ImageFont.FreeTypeFont, font_pt: int, box_h: int, spacing: int) -> int:
@@ -858,7 +918,7 @@ def _solve_dp_fixed_lines(
   tokens: List[AtomicToken],
   widths: List[float],
   font: ImageFont.FreeTypeFont,
-  max_lines: int,
+  line_count: int,
   lang: str,
 ) -> Tuple[float, List[str]]:
   n = len(tokens)
@@ -898,34 +958,59 @@ def _solve_dp_fixed_lines(
         width_content = _text_width(seg_text, font)
         
         if width_content > max_w:
-             # Stop expanding, this token makes it too big even without hyphen
-             # Exception: if it's the ONLY token on line, we must accept it (overflow)
-             if j == i:
-                 pass 
-             else:
-                 break
+             # Stop expanding: this token overflows the current line width.
+             break
                  
         current_line_text = seg_text
         
         # Evaluate break after j
         if not tokens[j].can_break:
             continue
+
+        # Linguistic no-break rules at plain word boundaries.
+        if j < n - 1 and (" " in (tokens[j].join_cont or "")):
+          if not _break_allowed(tokens[j].text, tokens[j + 1].text, lang=lang):
+            continue
             
         # Check fit with hyphen
-        if width_if_break > max_w and j > i:
-            # Can't break here because hyphen makes it overflow
+        if width_if_break > max_w:
+            # Can't break here because rendered line would overflow.
             continue
             
         slack = max(0.0, float(max_w) - width_if_break)
         
         # Cost
-        is_last_overall = (k == num_lines - 1) and (j == n - 1)
-        ragged_weight = 10.0
+        is_last_line = (k == num_lines - 1)
+        ragged_weight = 10.0 if not is_last_line else 4.0
         ragged = (slack / max(1.0, float(max_w))) ** 2 * ragged_weight
         
         # Penalties
         pen = tokens[j].penalty
-        
+        pen += _line_end_penalty(tokens[j].text, lang=lang)
+        pen += _punct_break_bonus(tokens[j].text)
+
+        # Auto-inserted hyphen breaks are useful, but expensive by default.
+        # Strongly discourage very short fragments around the split.
+        if (tokens[j].join_break == "-") and ((tokens[j].join_cont or "") == ""):
+          left_len = len(_tok_norm(tokens[j].text))
+          right_len = len(_tok_norm(tokens[j + 1].text)) if j < n - 1 else 0
+          if left_len <= 2 or right_len <= 2:
+            pen += 40.0
+          elif left_len <= 3 or right_len <= 3:
+            pen += 24.0
+          elif left_len <= 4 or right_len <= 4:
+            pen += 16.0
+          else:
+            pen += 14.0
+
+          # Proper names (capitalized) are visually worse when hyphen-split.
+          if tokens[j].text and str(tokens[j].text)[0].isupper():
+            pen += 12.0
+
+        # Soft preference for fewer line breaks.
+        if not is_last_line:
+          pen += 0.35
+
         line_cost = ragged + pen
         
         if cost_so_far + line_cost < dp[k+1][j+1]:
@@ -965,34 +1050,91 @@ def _compose_paragraph_dp(
   max_width: int,
   max_lines: int,
   lang: str,
+  profile_alpha: float = 0.75,
+  profile_min_factor: float = 0.66,
+  line_break_penalty: float = 0.4,
+  shape_penalty: float = 2.2,
+  center_peak_penalty: float = 1.8,
+  hyphen_break_penalty: float = 4.0,
 ) -> str:
-  tokens = _tokenize_atomic(para, lang=lang)
-  if not tokens:
+  tokens_plain = _tokenize_atomic(para, lang=lang, allow_auto_hyphen=False)
+  tokens_auto = _tokenize_atomic(para, lang=lang, allow_auto_hyphen=True)
+
+  plans: List[Tuple[bool, List[AtomicToken]]] = []
+  if tokens_plain:
+    plans.append((False, tokens_plain))
+  if tokens_auto:
+    plans.append((True, tokens_auto))
+  if not plans:
     return ""
-    
-  n = len(tokens)
-  
-  # Heuristics for search
-  total_text_len = sum(len(t.text) for t in tokens) # approx char length
-  avg_w = _text_width("x", font)
-  total_px = total_text_len * avg_w
-  min_lines = max(1, int(total_px / float(max_width)))
-  
+
   best_cost = 1e18
   best_lines = []
-  
-  start_L = max(1, min_lines)
-  
-  for L in range(start_L, max_lines + 1):
+  word_count = len(_tokenize_ws(para))
+  hyphen_penalty_eff = float(hyphen_break_penalty)
+  if word_count <= 2:
+    hyphen_penalty_eff *= 0.35
+  elif word_count <= 4:
+    hyphen_penalty_eff *= 0.65
+
+  # Keep deterministic behaviour: one line is allowed only if it actually fits.
+  one_line_possible = (_text_width(para, font) <= float(max_width))
+
+  for auto_hyphen, tokens in plans:
+    # Heuristics for search.
+    total_text_len = sum(len(t.text) for t in tokens)
+    avg_w = _text_width("x", font)
+    total_px = total_text_len * avg_w
+    min_lines = max(1, int(total_px / float(max_width)))
+
+    if one_line_possible:
+      start_L = 1
+    else:
+      start_L = max(2, min_lines)
+    start_L = max(1, min(int(max_lines), int(start_L)))
+
+    for L in range(start_L, max_lines + 1):
       widths = []
       for i in range(L):
-          f = _get_shape_factor(i, L)
-          widths.append(float(max_width) * f)
-          
-      cost, lines = _solve_dp_fixed_lines(tokens, widths, font, max_lines, lang)
+        # For 1-2 lines keep profile flatter; aggressive taper there is rarely useful.
+        if L <= 2:
+          f = 1.0
+        else:
+          f = _get_shape_factor(i, L, alpha=profile_alpha, min_factor=profile_min_factor)
+        widths.append(float(max_width) * f)
+
+      cost, lines = _solve_dp_fixed_lines(tokens, widths, font, L, lang)
+      if cost >= 1e18 or not lines:
+        continue
+
+      line_widths = [max(0.0, _text_width((ln or "").rstrip(), font)) for ln in lines]
+      if len(line_widths) >= 3:
+        cost += _shape_sequence_penalty(line_widths) * float(shape_penalty)
+        cost += _center_peak_penalty(line_widths) * float(center_peak_penalty)
+      elif len(line_widths) == 2:
+        cost += _shape_sequence_penalty(line_widths) * float(shape_penalty) * 0.25
+
+      # Avoid over-aggressive hyphenation at higher font sizes.
+      hyphen_breaks = 0
+      for ln in lines[:-1]:
+        s = (ln or "").strip()
+        if not s.endswith("-"):
+          continue
+        # Keep stutter-like forms ("С-се- / стра") relatively cheap.
+        if s.count("-") >= 2:
+          continue
+        hyphen_breaks += 1
+      cost += float(hyphen_breaks) * float(hyphen_penalty_eff)
+
+      # Prefer non-auto-hyphen layouts when quality is close.
+      if auto_hyphen:
+        cost += 1.3
+
+      # Softly prefer fewer lines when quality is close.
+      cost += max(0, L - 1) * float(line_break_penalty)
       if cost < best_cost:
-          best_cost = cost
-          best_lines = lines
+        best_cost = cost
+        best_lines = lines
           
   if not best_lines:
         return _wrap_text(para, font, max_width=max_width)
@@ -1019,6 +1161,43 @@ def _compose_text_output(
   enabled = bool(komp.get("enabled", False))
   mode = str(komp.get("mode", "auto") or "auto").strip().lower()
   lang = _detect_lang(text, fallback=str(komp.get("lang", "auto")))
+  profile_cfg = komp.get("profile") if isinstance(komp, dict) else None
+  if not isinstance(profile_cfg, dict):
+    profile_cfg = {}
+  bubble_profile = config.get("_layout_profile") if isinstance(config, dict) else None
+  if not isinstance(bubble_profile, dict):
+    bubble_profile = {}
+
+  alpha = _safe_float(
+    bubble_profile.get("alpha", profile_cfg.get("alpha", 0.78)),
+    0.78,
+  )
+  min_factor = _safe_float(
+    bubble_profile.get("min_factor", profile_cfg.get("min_factor", 0.64)),
+    0.64,
+  )
+  line_break_penalty = _safe_float(
+    bubble_profile.get("line_break_penalty", profile_cfg.get("line_break_penalty", 0.42)),
+    0.42,
+  )
+  shape_penalty = _safe_float(
+    bubble_profile.get("shape_penalty", profile_cfg.get("shape_penalty", 1.8)),
+    1.8,
+  )
+  center_peak_penalty = _safe_float(
+    bubble_profile.get("center_peak_penalty", profile_cfg.get("center_peak_penalty", 1.6)),
+    1.6,
+  )
+  hyphen_break_penalty = _safe_float(
+    bubble_profile.get("hyphen_break_penalty", profile_cfg.get("hyphen_break_penalty", 4.0)),
+    4.0,
+  )
+  alpha = max(0.0, min(0.95, float(alpha)))
+  min_factor = max(0.45, min(1.0, float(min_factor)))
+  line_break_penalty = max(0.0, min(4.0, float(line_break_penalty)))
+  shape_penalty = max(0.0, min(8.0, float(shape_penalty)))
+  center_peak_penalty = max(0.0, min(8.0, float(center_peak_penalty)))
+  hyphen_break_penalty = max(0.0, min(12.0, float(hyphen_break_penalty)))
 
   raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
   if not raw:
@@ -1049,6 +1228,12 @@ def _compose_text_output(
         max_width=int(max_width),
         max_lines=int(max_lines),
         lang=lang,
+        profile_alpha=alpha,
+        profile_min_factor=min_factor,
+        line_break_penalty=line_break_penalty,
+        shape_penalty=shape_penalty,
+        center_peak_penalty=center_peak_penalty,
+        hyphen_break_penalty=hyphen_break_penalty,
       )
     )
 
@@ -1121,6 +1306,113 @@ def _measure_multiline_text(
       lh = int(getattr(font, "size", 16) + int(spacing))
     th = int(len(lines) * lh)
     return max(0, tw), max(0, th)
+
+
+def _layout_badness_score(layout_text: str) -> float:
+  lines = (layout_text or "").split("\n") if layout_text else []
+  if not lines:
+    return 0.0
+  word_count = len(_tokenize_ws(" ".join(lines)))
+  if word_count <= 2:
+    hyphen_w = 1.0
+    short_hyphen_w = 8.0
+  elif word_count <= 4:
+    hyphen_w = 2.0
+    short_hyphen_w = 3.8
+  else:
+    hyphen_w = 3.0
+    short_hyphen_w = 5.0
+
+  stutter_like = False
+  if len(lines) >= 2:
+    l0 = (lines[0] or "").strip()
+    l1 = (lines[1] or "").strip()
+    l0n = _tok_norm(l0.rstrip("-"))
+    l1n = _tok_norm(l1)
+    if l0.endswith("-") and len(l0n) <= 2 and l1n:
+      stutter_like = True
+
+  hyphen_breaks = 0
+  short_hyphen_breaks = 0
+  tiny_lines = 0
+  for i, ln in enumerate(lines):
+    s = (ln or "").strip()
+    if len(_tok_norm(s)) <= 2 and i < len(lines) - 1 and not (stutter_like and i == 0):
+      tiny_lines += 1
+    if s.endswith("-"):
+      hyphen_breaks += 1
+      frag = _tok_norm(s[:-1].split(" ")[-1] if " " in s[:-1] else s[:-1])
+      if len(frag) <= 3 and not (stutter_like and i == 0):
+        short_hyphen_breaks += 1
+
+  # Approximate visual line widths to penalize non "narrow-wide-narrow" sequences.
+  width_chars: List[float] = []
+  for ln in lines:
+    compact = re.sub(r"\s+", "", (ln or "").strip())
+    width_chars.append(float(len(compact)))
+  shape_bad = _shape_sequence_penalty(width_chars)
+  peak_bad = _center_peak_penalty(width_chars)
+
+  return (
+    (hyphen_breaks * hyphen_w)
+    + (short_hyphen_breaks * short_hyphen_w)
+    + (tiny_lines * 2.0)
+    + (shape_bad * 0.55)
+    + (peak_bad * 0.45)
+  )
+
+
+def _shape_sequence_penalty(line_widths: List[float]) -> float:
+  n = len(line_widths)
+  if n <= 2:
+    return 0.0
+
+  pen = 0.0
+  peak = (float(n) - 1.0) / 2.0
+  for i in range(n - 1):
+    cur = float(line_widths[i])
+    nxt = float(line_widths[i + 1])
+    # Before peak width should grow; after peak it should shrink.
+    should_grow = (float(i) + 0.5) < peak
+    if should_grow and nxt < cur:
+      pen += ((cur - nxt) / max(12.0, cur)) * 8.0
+    if (not should_grow) and nxt > cur:
+      pen += ((nxt - cur) / max(12.0, nxt)) * 8.0
+
+  peak_w = max(float(w) for w in line_widths)
+  edge_w = max(float(line_widths[0]), float(line_widths[-1]))
+  if peak_w > 0.0 and edge_w > (peak_w * 0.95):
+    pen += ((edge_w / peak_w) - 0.95) * 12.0
+  return pen
+
+
+def _center_peak_penalty(line_widths: List[float]) -> float:
+  n = len(line_widths)
+  if n <= 2:
+    return 0.0
+
+  widths = [max(0.0, float(w)) for w in line_widths]
+  peak_idx = max(range(n), key=lambda i: widths[i])
+  center = (float(n) - 1.0) / 2.0
+
+  pen = abs(float(peak_idx) - center) * 2.4
+
+  edge_w = max(widths[0], widths[-1])
+  if n % 2 == 1:
+    center_w = widths[n // 2]
+    if center_w > 0.0 and edge_w >= center_w:
+      pen += ((edge_w - center_w) / max(12.0, center_w)) * 18.0
+  else:
+    c1 = (n // 2) - 1
+    c2 = n // 2
+    center_w = max(widths[c1], widths[c2])
+    if center_w > 0.0 and edge_w >= center_w:
+      pen += ((edge_w - center_w) / max(12.0, center_w)) * 14.0
+
+  # Very asymmetric top/bottom edges look visually noisy inside rounded bubbles.
+  edge_max = max(12.0, edge_w)
+  pen += (abs(widths[0] - widths[-1]) / edge_max) * 3.0
+  return pen
 
 
 def _max_fitting_size(
@@ -1465,6 +1757,119 @@ def _select_font_hint_for_bubble(
   return entry
 
 
+def _layout_profile_for_bubble(
+  *,
+  bubble_bbox: Tuple[float, float, float, float],
+  core_bbox: Tuple[float, float, float, float],
+  geom_item: Dict[str, Any],
+  class_info: Dict[str, Any],
+  config: Dict[str, Any],
+) -> Dict[str, float]:
+  komp = config.get("komponovka") if isinstance(config, dict) else None
+  if not isinstance(komp, dict):
+    komp = {}
+  profile_cfg = komp.get("profile")
+  if not isinstance(profile_cfg, dict):
+    profile_cfg = {}
+
+  bubble_w = max(1.0, float(bubble_bbox[2] - bubble_bbox[0]))
+  bubble_h = max(1.0, float(bubble_bbox[3] - bubble_bbox[1]))
+  core_w = max(1.0, float(core_bbox[2] - core_bbox[0]))
+  core_h = max(1.0, float(core_bbox[3] - core_bbox[1]))
+  bubble_area = bubble_w * bubble_h
+  core_area = core_w * core_h
+  shape_factor = core_area / bubble_area if bubble_area > 0 else 0.5
+  aspect = bubble_w / bubble_h if bubble_h > 0 else 1.0
+
+  src = str((geom_item or {}).get("source") or "").lower()
+  fallback = (not src) or src.startswith("bbox_fallback")
+  label = str((class_info or {}).get("class") or (class_info or {}).get("label") or "").strip().lower()
+
+  preset = "mild"
+  if label == "rectangle":
+    preset = "rect"
+  elif label in {"thorn", "cloude", "sea_uchirin"}:
+    preset = "tapered"
+  elif not fallback:
+    if shape_factor >= 0.62 or aspect >= 1.40:
+      preset = "rect"
+    elif shape_factor <= 0.44:
+      preset = "tapered"
+    else:
+      preset = "ellipse"
+  elif label == "elipse":
+    preset = "ellipse"
+
+  table: Dict[str, Dict[str, float]] = {
+    "rect": {
+      "alpha": 0.64,
+      "min_factor": 0.74,
+      "line_break_penalty": 0.78,
+      "shape_penalty": 1.4,
+      "center_peak_penalty": 1.2,
+      "hyphen_break_penalty": 4.4,
+    },
+    "mild": {
+      "alpha": 0.72,
+      "min_factor": 0.68,
+      "line_break_penalty": 0.60,
+      "shape_penalty": 1.8,
+      "center_peak_penalty": 1.6,
+      "hyphen_break_penalty": 4.2,
+    },
+    "ellipse": {
+      "alpha": 0.82,
+      "min_factor": 0.60,
+      "line_break_penalty": 0.50,
+      "shape_penalty": 2.1,
+      "center_peak_penalty": 1.8,
+      "hyphen_break_penalty": 4.0,
+    },
+    "tapered": {
+      "alpha": 0.88,
+      "min_factor": 0.56,
+      "line_break_penalty": 0.44,
+      "shape_penalty": 2.3,
+      "center_peak_penalty": 2.0,
+      "hyphen_break_penalty": 3.8,
+    },
+  }
+  out = dict(table.get(preset, table["mild"]))
+
+  # Very tall balloons benefit from slightly stronger tapering.
+  if (bubble_h / bubble_w) >= 1.35 and preset in {"ellipse", "tapered"}:
+    out["alpha"] += 0.05
+    out["min_factor"] -= 0.03
+
+  # Fallback: keep profile close to "narrow-wide-narrow", only slightly milder.
+  if fallback:
+    out["alpha"] *= 0.96
+    out["min_factor"] += 0.02
+    out["line_break_penalty"] += 0.06
+    out["shape_penalty"] = float(out.get("shape_penalty", 2.2)) * 0.92
+    out["center_peak_penalty"] = float(out.get("center_peak_penalty", 1.8)) * 0.92
+    out["hyphen_break_penalty"] = float(out.get("hyphen_break_penalty", 4.0)) + 0.30
+
+  for key in (
+    "alpha",
+    "min_factor",
+    "line_break_penalty",
+    "shape_penalty",
+    "center_peak_penalty",
+    "hyphen_break_penalty",
+  ):
+    if key in profile_cfg:
+      out[key] = _safe_float(profile_cfg.get(key), out[key])
+
+  out["alpha"] = max(0.0, min(0.95, float(out.get("alpha", 0.72))))
+  out["min_factor"] = max(0.45, min(1.0, float(out.get("min_factor", 0.66))))
+  out["line_break_penalty"] = max(0.0, min(4.0, float(out.get("line_break_penalty", 0.45))))
+  out["shape_penalty"] = max(0.0, min(8.0, float(out.get("shape_penalty", 2.2))))
+  out["center_peak_penalty"] = max(0.0, min(8.0, float(out.get("center_peak_penalty", 1.8))))
+  out["hyphen_break_penalty"] = max(0.0, min(12.0, float(out.get("hyphen_break_penalty", 4.0))))
+  return out
+
+
 def _compute_adaptive_reduction(
   best_pt: int,
   layout_bbox: Tuple[float, float, float, float],
@@ -1538,7 +1943,16 @@ def _compute_adaptive_reduction(
     # Wrap and measure text at this pt
     try:
       spacing = int(round(float(pt) * float(leading_factor)))
-      wrapped = _wrap_text_komponovka(text, font, int(layout_w), draw, config)
+      composed, _applied = _compose_text_output(
+        text,
+        font,
+        max_width=int(layout_w),
+        max_height=int(layout_h),
+        font_pt=int(pt),
+        leading_factor=float(leading_factor),
+        config=config,
+      )
+      wrapped = composed or _wrap_text(text, font, int(layout_w))
       tw, th = _measure_multiline_text(wrapped, font, spacing=spacing, draw=draw)
     except Exception:
       continue
@@ -1651,7 +2065,23 @@ def compute_fit_map(
 
     bubble_bb = _bbox_tuple(b.get("bbox") or {}) or (0.0, 0.0, 1.0, 1.0)
     g = geom_items.get(bid) or {}
+    if not isinstance(g, dict):
+      g = {}
     core_bb = _bbox_tuple(g.get("core_bbox") or {}) or bubble_bb
+    class_info = {}
+    if isinstance(bubble_classes, dict):
+      maybe_info = bubble_classes.get(bid) or {}
+      if isinstance(maybe_info, dict):
+        class_info = maybe_info
+
+    bubble_cfg = dict(config)
+    bubble_cfg["_layout_profile"] = _layout_profile_for_bubble(
+      bubble_bbox=bubble_bb,
+      core_bbox=core_bb,
+      geom_item=g,
+      class_info=class_info,
+      config=config,
+    )
 
     o = ocr_items.get(bid) or {}
     ocr_bb = _bbox_tuple(o.get("ocr_bbox") or {}) or core_bb
@@ -1681,7 +2111,7 @@ def compute_fit_map(
         draw=draw,
         leading_factor=leading_factor,
         pts=pts_all,
-        config=config,
+        config=bubble_cfg,
       )
       if cand_pt is not None:
         best_pt = int(cand_pt)
@@ -1704,22 +2134,31 @@ def compute_fit_map(
       ccfg = {}
 
     if bool(ccfg.get("enabled", True)):
-      target = _safe_float(ccfg.get("target_slack", 0.08), 0.08)
+      target = _safe_float(ccfg.get("target_slack", 0.06), 0.06)
+      layout_badness_weight = _safe_float(ccfg.get("layout_badness_weight", 0.7), 0.7)
+      hyphen_util_penalty = _safe_float(ccfg.get("hyphen_util_penalty", 2.4), 2.4)
       try:
-        max_reduce = int(ccfg.get("max_reduce_pt", 6))
+        max_reduce = int(ccfg.get("max_reduce_pt", 4))
       except Exception:
-        max_reduce = 6
+        max_reduce = 4
       if max_reduce < 0:
         max_reduce = 0
+      layout_badness_weight = max(0.0, min(4.0, float(layout_badness_weight)))
+      hyphen_util_penalty = max(0.0, min(8.0, float(hyphen_util_penalty)))
+      text_word_count = len(_tokenize_ws(text))
+      if text_word_count <= 2:
+        hyphen_util_penalty *= 0.35
+      elif text_word_count <= 4:
+        hyphen_util_penalty *= 0.65
       # Snap to step (2pt by default).
       max_reduce = int((max_reduce // pt_step) * pt_step) if pt_step > 0 else int(max_reduce)
 
       if cov < 0.08:
-        target += 0.03
-      elif cov < 0.18:
         target += 0.02
-      elif cov < 0.30:
+      elif cov < 0.18:
         target += 0.01
+      elif cov < 0.30:
+        target += 0.005
 
       try:
         lc = int(o.get("line_count") or 0) if isinstance(o, dict) else 0
@@ -1728,7 +2167,11 @@ def compute_fit_map(
       if lc >= 4:
         target -= 0.01
 
-      target = max(0.04, min(0.15, float(target)))
+      src = str(g.get("source") or "").lower()
+      if (not src) or src.startswith("bbox_fallback"):
+        target -= 0.015
+
+      target = max(0.03, min(0.14, float(target)))
 
       bw_pt_fit = int(max(1.0, (chosen_layout[2] - chosen_layout[0]) * px_to_pt))
       bh_pt_fit = int(max(1.0, (chosen_layout[3] - chosen_layout[1]) * px_to_pt))
@@ -1738,31 +2181,56 @@ def compute_fit_map(
       pts_desc = [p for p in pts_all if int(min_allowed) <= int(p) <= int(best_pt)]
       pts_desc.sort(reverse=True)
 
-      for pt in pts_desc:
-        font = font_cache.get(int(pt))
-        if font is None:
-          continue
-        ok, measure_text, out_text = _fit_at_size(
-          text,
-          font,
-          int(pt),
-          bw_pt_fit,
-          bh_pt_fit,
-          draw=draw,
-          leading_factor=leading_factor,
-          config=config,
-        )
-        if not ok:
-          continue
-        spacing = int(round(float(pt) * float(leading_factor)))
-        tw, th = _measure_multiline_text(measure_text, font, spacing=spacing, draw=draw)
-        slack_w = (float(bw_pt_fit) - float(tw)) / float(bw_pt_fit) if bw_pt_fit > 0 else 0.0
-        slack_h = (float(bh_pt_fit) - float(th)) / float(bh_pt_fit) if bh_pt_fit > 0 else 0.0
-        slack = min(float(slack_w), float(slack_h))
-        if slack >= float(target):
-          best_pt = int(pt)
-          best_text = out_text
-          break
+      if max_reduce > 0 and int(best_pt) > int(min_pt):
+        best_choice_pt = int(best_pt)
+        best_choice_text = best_text
+        best_choice_util = float("-inf")
+        relaxed_choice_pt = int(best_pt)
+        relaxed_choice_text = best_text
+        relaxed_choice_util = float("-inf")
+        for pt in pts_desc:
+          font = font_cache.get(int(pt))
+          if font is None:
+            continue
+          ok, measure_text, out_text = _fit_at_size(
+            text,
+            font,
+            int(pt),
+            bw_pt_fit,
+            bh_pt_fit,
+            draw=draw,
+            leading_factor=leading_factor,
+            config=bubble_cfg,
+          )
+          if not ok:
+            continue
+          spacing = int(round(float(pt) * float(leading_factor)))
+          tw, th = _measure_multiline_text(measure_text, font, spacing=spacing, draw=draw)
+          slack_w = (float(bw_pt_fit) - float(tw)) / float(bw_pt_fit) if bw_pt_fit > 0 else 0.0
+          slack_h = (float(bh_pt_fit) - float(th)) / float(bh_pt_fit) if bh_pt_fit > 0 else 0.0
+          slack = min(float(slack_w), float(slack_h))
+          badness = _layout_badness_score(out_text)
+          hyphen_breaks = 0
+          for ln in (out_text or "").split("\n")[:-1]:
+            s = (ln or "").strip()
+            if s.endswith("-") and s.count("-") < 2:
+              hyphen_breaks += 1
+          util = float(pt) - (badness * float(layout_badness_weight)) - (float(hyphen_breaks) * float(hyphen_util_penalty))
+          if (util > relaxed_choice_util) or (abs(util - relaxed_choice_util) < 1e-9 and int(pt) > int(relaxed_choice_pt)):
+            relaxed_choice_util = util
+            relaxed_choice_pt = int(pt)
+            relaxed_choice_text = out_text
+          if slack >= float(target):
+            if (util > best_choice_util) or (abs(util - best_choice_util) < 1e-9 and int(pt) > int(best_choice_pt)):
+              best_choice_util = util
+              best_choice_pt = int(pt)
+              best_choice_text = out_text
+        if best_choice_util > float("-inf"):
+          best_pt = int(best_choice_pt)
+          best_text = best_choice_text
+        elif relaxed_choice_util > float("-inf"):
+          best_pt = int(relaxed_choice_pt)
+          best_text = relaxed_choice_text
 
     # Naturalness cap based on original OCR estimate (pixel→pt).
     est_px = o.get("font_est_px")
@@ -1780,20 +2248,7 @@ def compute_fit_map(
       cap_pt = max(cap_pts) if cap_pts else int(min_pt)
       best_pt = int(min(best_pt, cap_pt))
 
-    # Apply adaptive font size reduction (replaces fixed -4pt)
-    final_pt = _compute_adaptive_reduction(
-      best_pt=int(best_pt),
-      layout_bbox=chosen_layout,
-      core_bbox=core_bb,
-      bubble_bbox=bubble_bb,
-      text=text,
-      font_cache=font_cache,
-      draw=draw,
-      leading_factor=leading_factor,
-      config=config,
-      min_pt=int(min_pt),
-      max_reduction=8,
-    )
+    final_pt = int(best_pt)
     entry: Dict[str, Any] = {"font_pt": int(final_pt), "layout_bbox": _bbox_dict(chosen_layout)}
 
     komp = config.get("komponovka") if isinstance(config, dict) else None
@@ -1806,16 +2261,16 @@ def compute_fit_map(
       try:
         bw_pt_final = int(max(1.0, (chosen_layout[2] - chosen_layout[0]) * px_to_pt))
         bh_pt_final = int(max(1.0, (chosen_layout[3] - chosen_layout[1]) * px_to_pt))
-        font_final = font_cache.get(int(best_pt))
+        font_final = font_cache.get(int(final_pt))
         if font_final is not None:
           composed, _applied = _compose_text_output(
             text,
             font_final,
             max_width=bw_pt_final,
             max_height=bh_pt_final,
-            font_pt=int(best_pt),
+            font_pt=int(final_pt),
             leading_factor=float(leading_factor),
-            config=config,
+            config=bubble_cfg,
           )
           entry["layout_text"] = composed or (best_text or text)
         else:
