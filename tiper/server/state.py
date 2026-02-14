@@ -178,6 +178,10 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
       "seg_iou_thr": 0.30,
       # Inner safe region inside the bubble mask.
       "core_frac": 0.55,
+      # Light OCR bbox influence on initial fit area (bubble bbox/core stays primary).
+      "core_seed_scale": 1.03,
+      "ocr_bbox_influence": 0.30,
+      "ocr_bbox_influence_fallback": 0.16,
       # Font-fit heuristics (PIL approximation).
       "leading_factor": 0.25,
       "cap_factor": 1.25,
@@ -196,6 +200,14 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
         # Utility term weights for selecting a readable layout among fit candidates.
         "layout_badness_weight": 0.7,
         "hyphen_util_penalty": 2.4,
+        # How strict the monotonic "narrow-wide-narrow" check is during comfort pass.
+        "shape_tolerance_ratio": 0.04,
+        # Allowed hard-shape violations for the relaxed fallback.
+        "shape_relaxed_hard": 1,
+        # Final guard: if needed, lower pt until shape is monotonic.
+        "shape_guard_enabled": True,
+        "shape_target_hard": 0,
+        "shape_guard_max_drop_pt": 10,
         # Limit how much we can reduce the chosen font size for comfort.
         "max_reduce_pt": 4,
       },
@@ -215,6 +227,9 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
           "shape_penalty": 1.8,
           "center_peak_penalty": 1.6,
           "hyphen_break_penalty": 4.0,
+          # Bubble-contour-aware profile (ellipse fallback + polygon blend).
+          "poly_inset_frac": 0.11,
+          "poly_blend": 0.74,
         },
       },
     },
