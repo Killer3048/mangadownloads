@@ -1288,8 +1288,10 @@ def _compose_paragraph_dp(
   optimal layout. The DP solver handles per-line target widths and consecutive
   hyphen penalties internally.
   """
+  word_count = len(_tokenize_ws(para))
   tokens_plain = _tokenize_atomic(para, lang=lang, allow_auto_hyphen=False)
-  tokens_auto = _tokenize_atomic(para, lang=lang, allow_auto_hyphen=True)
+  allow_auto_plan = (word_count != 2)
+  tokens_auto = _tokenize_atomic(para, lang=lang, allow_auto_hyphen=True) if allow_auto_plan else []
 
   plans: List[Tuple[bool, List[AtomicToken]]] = []
   if tokens_plain:
@@ -1303,12 +1305,13 @@ def _compose_paragraph_dp(
   best_lines: List[str] = []
   best_strict_cost = 1e18
   best_strict_lines: List[str] = []
-  word_count = len(_tokenize_ws(para))
   hyphen_penalty_eff = float(hyphen_break_penalty) * 0.45
-  if word_count <= 2:
-    hyphen_penalty_eff *= 0.20
+  if word_count <= 1:
+    hyphen_penalty_eff *= 4.0
+  elif word_count == 2:
+    hyphen_penalty_eff *= 3.2
   elif word_count <= 4:
-    hyphen_penalty_eff *= 0.40
+    hyphen_penalty_eff *= 1.4
 
   one_line_possible = (_text_width(para, font) <= float(max_width))
 
@@ -1401,19 +1404,27 @@ def _compose_paragraph_dp(
 
         # Soft cap for excessive hyphenation: allow some, but avoid over-fragmented text.
         hyphen_cap = 1
-        if word_count >= 8:
+        if word_count <= 2:
+          hyphen_cap = 0
+        elif word_count >= 7:
           hyphen_cap = 2
-        if word_count >= 16:
+        if word_count >= 13:
           hyphen_cap = 3
-        hyphen_cap = min(int(hyphen_cap), max(1, int((L - 1) // 2) + (1 if L >= 6 else 0)))
-        if hyphen_breaks > hyphen_cap:
-          cost += float(hyphen_breaks - hyphen_cap) * 16.0
+        if hyphen_cap > 0:
+          hyphen_cap = min(int(hyphen_cap), max(1, int((L - 1) // 2) + (1 if L >= 6 else 0)))
+        if hyphen_breaks > int(hyphen_cap):
+          cost += float(hyphen_breaks - int(hyphen_cap)) * 16.0
         if max_hyphen_run >= 3:
           cost += float(max_hyphen_run - 2) * 12.0
 
         # Slight preference for non-auto-hyphen layouts when quality is very close.
         if auto_hyphen:
-          cost += 0.25
+          if word_count <= 2:
+            cost += 2.8
+          elif word_count <= 4:
+            cost += 0.8
+          else:
+            cost += 0.25
 
         # Vertical fill: prefer line counts that fill the bubble's height.
         # Layouts using fewer lines than max_lines leave vertical space empty.
@@ -2546,6 +2557,11 @@ def compute_fit_map(
         max_reduce = 4
       if max_reduce < 0:
         max_reduce = 0
+      if text_word_count <= 2:
+        max_reduce = max(max_reduce, 24)
+      elif text_word_count <= 4:
+        max_reduce = max(max_reduce, 12)
+      max_reduce = min(24, int(max_reduce))
       shape_tol_ratio = max(0.01, min(0.12, float(shape_tol_ratio)))
       shape_relaxed_hard = max(0, min(3, int(shape_relaxed_hard)))
       # Snap to step (2pt by default).
@@ -2624,7 +2640,12 @@ def compute_fit_map(
             if s.endswith("-") and s.count("-") < 2:
               hyphen_breaks += 1
           soft = float(shape_stats.get("soft", 0.0))
-          quality = (badness * 0.18) + (soft * 2.8) + (float(hyphen_breaks) * 0.12)
+          hy_quality_w = 0.12
+          if text_word_count <= 2:
+            hy_quality_w = 3.2
+          elif text_word_count <= 4:
+            hy_quality_w = 0.9
+          quality = (badness * 0.18) + (soft * 2.8) + (float(hyphen_breaks) * float(hy_quality_w))
 
           cand = (int(pt), out_text)
           cand_rank = (int(hard), float(quality), -int(pt))
@@ -2632,13 +2653,17 @@ def compute_fit_map(
             fallback_rank = cand_rank
             fallback_choice = cand
 
-          strict_hy_cap = 1
-          if text_word_count >= 7:
-            strict_hy_cap = 2
-          if text_word_count >= 13:
+          if text_word_count <= 2:
+            strict_hy_cap = 0
+          elif text_word_count <= 6:
+            strict_hy_cap = 1
+          elif text_word_count >= 13:
             strict_hy_cap = 3
-          line_hy_cap = max(1, int(round(float(max(1, len(layout_lines) - 1)) * 0.67)))
-          strict_hy_cap = min(int(strict_hy_cap), int(line_hy_cap))
+          else:
+            strict_hy_cap = 2
+          if int(strict_hy_cap) > 0:
+            line_hy_cap = max(1, int(round(float(max(1, len(layout_lines) - 1)) * 0.67)))
+            strict_hy_cap = min(int(strict_hy_cap), int(line_hy_cap))
 
           strict_slack_floor = max(0.010, float(target) * 0.35)
           if hard <= 0 and slack >= strict_slack_floor and hyphen_breaks <= strict_hy_cap:
