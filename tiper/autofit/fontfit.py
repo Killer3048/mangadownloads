@@ -130,7 +130,7 @@ def _tokenize_atomic(text: str, lang: str, *, allow_auto_hyphen: bool = True) ->
           trail = m.group(3) or ""
 
         syllables: List[str] = []
-        if dic and allow_seg_pyphen and len(core) > 6:
+        if dic and allow_seg_pyphen and len(core) > 3:
           # pyphen inserter returns "syl-la-ble"
           inserted = dic.inserted(core)
           if "-" in inserted:
@@ -163,11 +163,11 @@ def _tokenize_atomic(text: str, lang: str, *, allow_auto_hyphen: bool = True) ->
             # If break: add HYPHEN. If continue: add nothing (join parts).
             # Penalize very short fragments much harder to avoid unnatural hyphenation.
             rem = "".join(syllables[j + 1 :])
-            pen = 2.0  # Base penalty: hyphens are acceptable for shape
+            pen = 0.35  # Base penalty: shape-first, hyphenation is broadly allowed
             if len(syl) <= 2 or len(rem) <= 2:
-              pen += 1.5   # Even short fragments are OK for shape filling
+              pen += 1.00
             elif len(syl) <= 3 or len(rem) <= 3:
-              pen += 0.8
+              pen += 0.25
             out.append(AtomicToken(syl, True, pen, join_char="", join_break="-", join_cont=""))
               
   return out
@@ -436,7 +436,7 @@ def _wrap_text(text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
     # Try syllable hyphenation when available (pyphen), otherwise a simple heuristic for RU.
     def _hyphen_points(word: str) -> List[int]:
       w = word or ""
-      if len(w) < 6:
+      if len(w) < 5:
         return []
       # 1) pyphen (if installed)
       try:
@@ -995,9 +995,16 @@ def _shape_monotonicity_stats(line_widths: Sequence[float], *, tol_ratio: float 
   edge_w = max(widths[0], widths[-1])
   edge_ratio = edge_w / max(1.0, peak_w)
 
-  if edge_ratio > 0.92:
+  edge_hard_thr = 0.92
+  if n == 3:
+    # For short 3-line phrases edge flattening is often inevitable; keep it soft-only.
+    edge_hard_thr = 1.01
+  elif n == 4:
+    edge_hard_thr = 0.95
+
+  if edge_ratio > edge_hard_thr:
     hard += 1
-  soft += max(0.0, edge_ratio - 0.82) * 4.0
+  soft += max(0.0, edge_ratio - (edge_hard_thr - 0.10)) * 4.0
   soft += float(peak_shift) * 0.60
 
   return {
@@ -1219,9 +1226,9 @@ def _solve_dp_fixed_lines(
         pen += _punct_break_bonus(tokens[j].text)
 
         if is_hyphen_break:
-          pen += 1.8
+          pen += 0.65
           if tokens[j].text and str(tokens[j].text)[0].isupper():
-            pen += 3.2
+            pen += 1.1
 
         pen += 0.08
 
@@ -1297,13 +1304,27 @@ def _compose_paragraph_dp(
   best_strict_cost = 1e18
   best_strict_lines: List[str] = []
   word_count = len(_tokenize_ws(para))
-  hyphen_penalty_eff = float(hyphen_break_penalty)
+  hyphen_penalty_eff = float(hyphen_break_penalty) * 0.45
   if word_count <= 2:
-    hyphen_penalty_eff *= 0.30
+    hyphen_penalty_eff *= 0.20
   elif word_count <= 4:
-    hyphen_penalty_eff *= 0.55
+    hyphen_penalty_eff *= 0.40
 
   one_line_possible = (_text_width(para, font) <= float(max_width))
+
+  mf_base = float(profile_min_factor)
+  if word_count <= 5:
+    mf_base = max(0.45, mf_base - 0.10)
+  elif word_count <= 8:
+    mf_base = max(0.45, mf_base - 0.05)
+
+  mf_variants: List[float] = [float(mf_base)]
+  if word_count <= 5:
+    mf_variants.append(max(0.45, float(mf_base) - 0.05))
+  elif word_count <= 8:
+    mf_variants.append(max(0.45, float(mf_base) - 0.03))
+  # Keep unique, stable order.
+  mf_variants = list(dict.fromkeys(float(v) for v in mf_variants))
 
   # Alpha variants to explore for better shape fitting
   alpha_variants = [
@@ -1319,11 +1340,12 @@ def _compose_paragraph_dp(
     for L in range(start_L, max_lines + 1):
       # For 1-2 lines, use flat profile; for 3+, try alpha variants
       if L <= 2:
-        variants = [(profile_alpha, profile_min_factor)]
+        variants = [(profile_alpha, float(mf_base))]
       else:
         variants = [
-          (a, float(profile_min_factor))
+          (a, mf_v)
           for a in alpha_variants
+          for mf_v in mf_variants
         ]
 
       for alpha_v, mf_v in variants:
@@ -1350,9 +1372,9 @@ def _compose_paragraph_dp(
         shape_soft = float(shape_stats.get("soft", 0.0))
 
         if len(line_widths) >= 4 and shape_hard > 0:
-          cost += float(shape_hard) * 120.0
+          cost += float(shape_hard) * 130.0
         elif len(line_widths) == 3 and shape_hard > 0:
-          cost += float(shape_hard) * 70.0
+          cost += float(shape_hard) * 90.0
 
         cost += shape_soft * 9.0
 
@@ -1364,15 +1386,34 @@ def _compose_paragraph_dp(
 
         # Post-hoc: small penalty per hyphen (shape is more important)
         hyphen_breaks = 0
+        hyphen_run = 0
+        max_hyphen_run = 0
         for idx, ln in enumerate(lines[:-1]):
           s = (ln or "").strip()
           if s.endswith("-") and s.count("-") < 2:
             hyphen_breaks += 1
-        cost += float(hyphen_breaks) * float(hyphen_penalty_eff) * 0.22
+            hyphen_run += 1
+            if hyphen_run > max_hyphen_run:
+              max_hyphen_run = hyphen_run
+          else:
+            hyphen_run = 0
+        cost += float(hyphen_breaks) * float(hyphen_penalty_eff) * 0.12
+
+        # Soft cap for excessive hyphenation: allow some, but avoid over-fragmented text.
+        hyphen_cap = 1
+        if word_count >= 8:
+          hyphen_cap = 2
+        if word_count >= 16:
+          hyphen_cap = 3
+        hyphen_cap = min(int(hyphen_cap), max(1, int((L - 1) // 2) + (1 if L >= 6 else 0)))
+        if hyphen_breaks > hyphen_cap:
+          cost += float(hyphen_breaks - hyphen_cap) * 16.0
+        if max_hyphen_run >= 3:
+          cost += float(max_hyphen_run - 2) * 12.0
 
         # Slight preference for non-auto-hyphen layouts when quality is very close.
         if auto_hyphen:
-          cost += 0.5
+          cost += 0.25
 
         # Vertical fill: prefer line counts that fill the bubble's height.
         # Layouts using fewer lines than max_lines leave vertical space empty.
@@ -1380,14 +1421,12 @@ def _compose_paragraph_dp(
         if max_lines > 1:
           fill_ratio_v = float(L) / float(max_lines)
           if fill_ratio_v < 0.5:
-            # Very under-filled: very strong penalty
-            cost += (1.0 - fill_ratio_v) * 25.0
+            # Under-filled vertically: keep only a moderate preference.
+            cost += (1.0 - fill_ratio_v) * 2.5
           elif fill_ratio_v < 0.75:
-            # Under-filled: strong penalty
-            cost += (1.0 - fill_ratio_v) * 12.0
+            cost += (1.0 - fill_ratio_v) * 1.0
           elif fill_ratio_v < 0.90:
-            # Slightly under-filled: moderate penalty
-            cost += (1.0 - fill_ratio_v) * 5.0
+            cost += (1.0 - fill_ratio_v) * 0.3
           # else: well-filled or fully filled, no penalty
 
         strict_shape_ok = (len(line_widths) <= 2) or (shape_hard <= 0)
@@ -1614,14 +1653,14 @@ def _layout_badness_score(layout_text: str) -> float:
     return 0.0
   word_count = len(_tokenize_ws(" ".join(lines)))
   if word_count <= 2:
-    hyphen_w = 1.0
-    short_hyphen_w = 8.0
+    hyphen_w = 0.6
+    short_hyphen_w = 2.2
   elif word_count <= 4:
-    hyphen_w = 2.0
-    short_hyphen_w = 3.8
+    hyphen_w = 0.9
+    short_hyphen_w = 1.8
   else:
-    hyphen_w = 3.0
-    short_hyphen_w = 5.0
+    hyphen_w = 1.2
+    short_hyphen_w = 2.4
 
   stutter_like = False
   if len(lines) >= 2:
@@ -2164,6 +2203,10 @@ def _layout_profile_for_bubble(
     if key in profile_cfg:
       out[key] = _safe_float(profile_cfg.get(key), out[key])
 
+  # Shape-first policy: allow substantially freer hyphenation if it improves
+  # the target narrow-wide-narrow contour.
+  out["hyphen_break_penalty"] = float(out.get("hyphen_break_penalty", 4.0)) * 0.58
+
   out["alpha"] = max(0.0, min(0.95, float(out.get("alpha", 0.72))))
   out["min_factor"] = max(0.45, min(1.0, float(out.get("min_factor", 0.66))))
   out["line_break_penalty"] = max(0.0, min(4.0, float(out.get("line_break_penalty", 0.45))))
@@ -2399,11 +2442,19 @@ def compute_fit_map(
     except Exception:
       ocr_line_count = 0
 
-    # In bbox-fallback mode, core bbox can be overly conservative for short lines.
-    # Slightly expand toward the bubble bbox to restore usable width.
+    # In bbox-fallback mode, core bbox is often too conservative.
+    # Move the fit area toward the bubble bbox so the layout follows bubble shape.
     core_fit_bb = core_bb
-    if fallback_src and (ocr_line_count <= 1 or text_word_count <= 3):
-      core_fit_bb = _clamp_bbox(_expand_bbox_about_center(core_bb, scale=1.14), bubble_bb)
+    if fallback_src:
+      if cov < 0.15:
+        fallback_blend = 0.24
+      elif cov < 0.30:
+        fallback_blend = 0.20
+      else:
+        fallback_blend = 0.16
+      core_fit_bb = _clamp_bbox(_blend_bbox(core_bb, bubble_bb, fallback_blend), bubble_bb)
+      if ocr_line_count <= 1 or text_word_count <= 3:
+        core_fit_bb = _clamp_bbox(_expand_bbox_about_center(core_fit_bb, scale=1.10), bubble_bb)
 
     clamp_bb = _comfort_clamp_bbox(core_fit_bb, cov=cov, ocr_item=o if isinstance(o, dict) else {}, geom_item=g if isinstance(g, dict) else {}, config=config)
     clamp_bb = _relax_fallback_clamp_for_short_text(
@@ -2522,7 +2573,9 @@ def compute_fit_map(
       elif text_word_count <= 6:
         target -= 0.005
 
-      target = max(0.03, min(0.14, float(target)))
+      # Keep comfort reduction softer to preserve optical size unless shape really demands shrink.
+      target *= 0.90
+      target = max(0.028, min(0.12, float(target)))
 
       bw_pt_fit = int(max(1.0, (chosen_layout[2] - chosen_layout[0]) * px_to_pt))
       bh_pt_fit = int(max(1.0, (chosen_layout[3] - chosen_layout[1]) * px_to_pt))
@@ -2571,7 +2624,7 @@ def compute_fit_map(
             if s.endswith("-") and s.count("-") < 2:
               hyphen_breaks += 1
           soft = float(shape_stats.get("soft", 0.0))
-          quality = (badness * 0.25) + (soft * 2.8) + (float(hyphen_breaks) * 0.35)
+          quality = (badness * 0.18) + (soft * 2.8) + (float(hyphen_breaks) * 0.12)
 
           cand = (int(pt), out_text)
           cand_rank = (int(hard), float(quality), -int(pt))
@@ -2579,12 +2632,21 @@ def compute_fit_map(
             fallback_rank = cand_rank
             fallback_choice = cand
 
-          if slack < float(target):
-            continue
+          strict_hy_cap = 1
+          if text_word_count >= 7:
+            strict_hy_cap = 2
+          if text_word_count >= 13:
+            strict_hy_cap = 3
+          line_hy_cap = max(1, int(round(float(max(1, len(layout_lines) - 1)) * 0.67)))
+          strict_hy_cap = min(int(strict_hy_cap), int(line_hy_cap))
 
-          if hard <= 0:
+          strict_slack_floor = max(0.010, float(target) * 0.35)
+          if hard <= 0 and slack >= strict_slack_floor and hyphen_breaks <= strict_hy_cap:
             strict_choice = cand
             break
+
+          if slack < float(target):
+            continue
 
           if relaxed_choice is None and hard <= int(shape_relaxed_hard):
             relaxed_choice = cand
@@ -2622,6 +2684,11 @@ def compute_fit_map(
     except Exception:
       shape_target_hard = 0
     shape_target_hard = max(0, min(3, int(shape_target_hard)))
+    shape_strict_retry_enabled = bool(ccfg.get("shape_strict_retry_enabled", False))
+    shape_strict_alpha_boost = max(0.0, min(0.20, _safe_float(ccfg.get("shape_strict_alpha_boost", 0.08), 0.08)))
+    shape_strict_min_factor_drop = max(0.0, min(0.20, _safe_float(ccfg.get("shape_strict_min_factor_drop", 0.06), 0.06)))
+    shape_strict_shape_penalty_boost = max(0.0, min(4.0, _safe_float(ccfg.get("shape_strict_shape_penalty_boost", 1.2), 1.2)))
+    shape_strict_center_penalty_boost = max(0.0, min(4.0, _safe_float(ccfg.get("shape_strict_center_penalty_boost", 1.0), 1.0)))
     try:
       shape_guard_max_drop_pt = int(ccfg.get("shape_guard_max_drop_pt", 10))
     except Exception:
@@ -2662,6 +2729,38 @@ def compute_fit_map(
         hard_guard = int(shape_guard.get("hard", 0.0))
         soft_guard = float(shape_guard.get("soft", 0.0))
         line_count_guard = int(shape_guard.get("line_count", 0.0))
+
+        if shape_strict_retry_enabled and line_count_guard >= 3 and hard_guard > int(shape_target_hard):
+          strict_cfg = dict(bubble_cfg)
+          strict_profile = strict_cfg.get("_layout_profile")
+          if not isinstance(strict_profile, dict):
+            strict_profile = {}
+          strict_profile = dict(strict_profile)
+          strict_profile["alpha"] = min(0.95, _safe_float(strict_profile.get("alpha", 0.78), 0.78) + float(shape_strict_alpha_boost))
+          strict_profile["min_factor"] = max(0.45, _safe_float(strict_profile.get("min_factor", 0.62), 0.62) - float(shape_strict_min_factor_drop))
+          strict_profile["shape_penalty"] = min(8.0, _safe_float(strict_profile.get("shape_penalty", 2.5), 2.5) + float(shape_strict_shape_penalty_boost))
+          strict_profile["center_peak_penalty"] = min(8.0, _safe_float(strict_profile.get("center_peak_penalty", 2.0), 2.0) + float(shape_strict_center_penalty_boost))
+          strict_cfg["_layout_profile"] = strict_profile
+
+          ok_strict, _measure_text_strict, out_text_strict = _fit_at_size(
+            text,
+            font_guard,
+            int(pt),
+            bw_pt_final,
+            bh_pt_final,
+            draw=draw,
+            leading_factor=leading_factor,
+            config=strict_cfg,
+          )
+          if ok_strict:
+            strict_stats = _layout_shape_stats(out_text_strict, font_guard, tol_ratio=float(shape_tol_ratio_final))
+            hard_strict = int(strict_stats.get("hard", 0.0))
+            soft_strict = float(strict_stats.get("soft", 0.0))
+            if (hard_strict < hard_guard) or (hard_strict == hard_guard and soft_strict < soft_guard):
+              out_text_guard = out_text_strict
+              hard_guard = hard_strict
+              soft_guard = soft_strict
+              line_count_guard = int(strict_stats.get("line_count", line_count_guard))
 
         if line_count_guard <= 2:
           strict_pick = (int(pt), out_text_guard)

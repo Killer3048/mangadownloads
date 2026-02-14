@@ -199,7 +199,7 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
         "target_slack": 0.06,
         # Utility term weights for selecting a readable layout among fit candidates.
         "layout_badness_weight": 0.7,
-        "hyphen_util_penalty": 2.4,
+        "hyphen_util_penalty": 1.2,
         # How strict the monotonic "narrow-wide-narrow" check is during comfort pass.
         "shape_tolerance_ratio": 0.04,
         # Allowed hard-shape violations for the relaxed fallback.
@@ -208,6 +208,12 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
         "shape_guard_enabled": True,
         "shape_target_hard": 0,
         "shape_guard_max_drop_pt": 10,
+        # Optional strict retry at the same pt before dropping the font size.
+        "shape_strict_retry_enabled": False,
+        "shape_strict_alpha_boost": 0.08,
+        "shape_strict_min_factor_drop": 0.06,
+        "shape_strict_shape_penalty_boost": 1.2,
+        "shape_strict_center_penalty_boost": 1.0,
         # Limit how much we can reduce the chosen font size for comfort.
         "max_reduce_pt": 4,
       },
@@ -226,7 +232,7 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
           "line_break_penalty": 0.42,
           "shape_penalty": 1.8,
           "center_peak_penalty": 1.6,
-          "hyphen_break_penalty": 4.0,
+          "hyphen_break_penalty": 2.6,
           # Bubble-contour-aware profile (ellipse fallback + polygon blend).
           "poly_inset_frac": 0.11,
           "poly_blend": 0.74,
