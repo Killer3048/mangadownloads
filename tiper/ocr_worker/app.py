@@ -319,7 +319,7 @@ def _get_vl():
     raise RuntimeError("paddleocr is not installed") from e
 
   _ensure_paddle_device()
-  return PaddleOCRVL(use_doc_orientation_classify=False, use_doc_unwarping=False)
+  return PaddleOCRVL(pipeline_version="v1", use_doc_orientation_classify=False, use_doc_unwarping=False)
 
 
 def _run_vl(img_rgb: Image.Image) -> List[Dict[str, Any]]:
