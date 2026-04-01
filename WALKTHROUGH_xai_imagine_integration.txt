@@ -1,0 +1,171 @@
+# Walkthrough: интеграция xAI `grok-imagine-image` в autotranslate пайплайн (красные квадраты)
+
+Цель: добавить в автопайплайн (Photoshop CEP `scanr` + FastAPI `tiper`) доп. функцию “manual imagine cleanup”:
+пользователь рисует **красные квадраты (outline only)** на всём скане (в PSD), и для каждого квадрата система:
+1) вырезает соответствующий фрагмент страницы, 2) отправляет в xAI **image edit** (`grok-imagine-image`) с промптом “Remove logo or text; …”,
+3) получает результат, 4) ресайзит под исходный ROI и 5) вставляет в PSD **как слои в отдельную группу (LayerSet/“папку”) над CLEANED_IMAGE**.
+
+Важно: в текущем пайплайне **синие прямоугольники** создаются группой `BUBBLES_DETECTED` и управляют bubble OCR/inpaint; новая фича **не должна ломать** текущие статусы job-а (`await_translation` и т.п.).
+Также важно (обсудили): ROI для xAI **вырезаем из `original.png`**, а не из `cleaned.png` (как в твоём ручном флоу: кроп → Grok UI → download → overlay в PSD).
+
+---
+
+## 0) Где сейчас autotranslate живёт
+
+**Photoshop extension (UI + ExtendScript)**
+- UI: `scanr/app_src/components/modal/autoTranslate.jsx`
+- JS utils (CEP ↔ server/host): `scanr/app_src/utils.js`
+- ExtendScript (Photoshop host): `scanr/app_src/host.js`
+
+**Backend**
+- FastAPI: `tiper/server/app.py`
+- jobs I/O: `tiper/server/jobs.py`, `tiper/server/schemas.py`
+- paths / UNC: `tiper/server/paths.py`
+
+Текущий flow (важное для интеграции):
+1) `exportActiveDocFlattenPng()` → `POST /jobs` (создаёт job + копирует `original.png`)
+2) `POST /jobs/:id/detect_bubbles` → `bubbles_auto.json` → создаём `BUBBLES_DETECTED` (синие)
+3) submit bubbles → `POST /jobs/:id/run_ocr_clean` → генерит `original.txt` + `cleaned.png` (+ frames/)
+4) `applyCleanedPngToActiveDoc()` кладёт `cleaned.png` в PSD как group `CLEANED` / layer `CLEANED_IMAGE`
+5) перевод: `POST /jobs/:id/get_translation` → создаём `TRANSLATION`
+
+---
+
+## 1) Что предлагает xAI и почему это подходит
+
+По xAI docs:
+- endpoint: `https://api.x.ai/v1/images/generations`
+- model: `grok-imagine-image`
+- есть режим **edit image**: в запрос можно передать исходную картинку как `image_url` data-URI (`data:image/...;base64,...`) + `prompt`.
+- можно получать результат как URL или base64 (`response_format=b64_json` / `image_format="base64"`).
+
+То есть наш кейс “берём кроп и просим убрать логотип/текст” реализуется как **image edit по кропу**.
+
+---
+
+## 2) UX/соглашения в PSD (что рисует пользователь)
+
+Рекомендация: выделить отдельную группу-слойсет для ROI квадратиков:
+- `IMAGINE_SQUARES` (название фиксируем как константу рядом с `BUBBLES_DETECTED`)
+- Внутри группы — shape-layers квадратов (stroke red, fill opacity 0).
+
+Мы читаем квадраты по **bounds** слоёв.
+Важно для точности: т.к. квадрат — это stroke-only shape layer, у `layer.bounds` может “включаться” толщина обводки. Для пиксель-в-пиксель лучше читать `boundsNoEffects` (или аналог) именно для `IMAGINE_SQUARES`, чтобы ROI совпадал с геометрией квадрата, а не с его обводкой.
+
+Валидация:
+- квадратность: `abs(w - h) <= tol` (например tol=2px). Если не квадрат — либо ошибка, либо автоприведение к квадрату (лучше: привести к квадрату по центру, side=max(w,h), с клипом по границам страницы).
+- минимальный размер (например ≥ 32px), иначе модель плохо восстанавливает.
+- клип по документу.
+
+---
+
+## 3) Предлагаемый data-flow (минимально инвазивный)
+
+### 3.1 Photoshop UI (scanr)
+Добавить новый шаг/кнопку в `AutoTranslateModal`, **но показывать/разрешать только если фича включена в Settings (default: OFF)**:
+- “4) xAI Imagine (remove logos/text)”
+
+Кнопка делает:
+1) `readBubbleRectanglesGroup("IMAGINE_SQUARES")` (функция уже generic: вызывает `getRectanglesFromGroup`).
+2) нормализует список в **squares**: `{ id, bbox: {left,top,right,bottom} }` (id можно взять из имени слоя, иначе генерить `R001..`).
+3) вызывает новый backend endpoint (см. ниже), прокидывая настройки xAI (в т.ч. ключ) из Settings расширения.
+4) ждёт completion (poll), затем вызывает новый ExtendScript метод “apply patches”.
+
+Settings (scanr) — добавить поля (и хранить в storage через `context.jsx`):
+- `xaiImagineEnabled` (boolean, default false)
+- `xaiApiKey` (string, default empty; хранится локально в storage CEP)
+- (опционально) `xaiImaginePrompt` (string, дефолтный prompt), `xaiImagineConcurrency` (1..4), `xaiImagineTimeoutSec`
+
+### 3.2 Server (tiper)
+Добавить endpoints, не меняя основной `job.status`:
+- `POST /jobs/{job_id}/imagine/start` (принимает squares + prompt + опции **и xAI key/настройки**, стартует thread)
+- `GET /jobs/{job_id}/imagine/status` (возвращает progress + список готовых patch-ов)
+
+Хранилище в job-dir (техническое, опционально; **пользовательский результат — в Photoshop-группе `IMAGINE_PATCHES`**):
+- `imagine/`
+  - `input/` — исходные кропы, которые ушли в xAI (debug)
+  - `output_raw/` — как вернул xAI (debug)
+  - `output_fit/` — **финальные кропы** ровно размера ROI (то, что вставляем)
+  - `patches.json` — metadata (bbox + путь к output_fit + prompt + timestamps)
+
+Сервер для каждого ROI:
+1) `src = original.png` (строго; это job-копия исходного flatten-export из Photoshop на момент создания job-а)
+2) `crop = src.crop(bbox)` (bbox в пикселях документа)
+3) POST в xAI images API как edit (`image_url=data:image/png;base64,...`, `prompt=...`, `model=grok-imagine-image`, `response_format=b64_json`)
+4) decode → image
+5) **resize** до `(roi_w, roi_h)` (LANCZOS), сохранить `output_fit/<id>.png`
+
+Важно: если output не квадрат/не той пропорции — делаем “contain + center crop” к ROI (иначе будет растяжение). Но если input ROI квадрат и xAI держит aspect, то чаще всего достаточно resize.
+
+Параллельность:
+- начать с sequential (чтобы не упереться в rate limit).
+- потом добавить ограниченный пул (например 2–4 concurrent) с backoff на 429.
+
+Конфиги/секреты:
+- Фича включается/выключается на фронте (default OFF).
+- `xaiApiKey` хранится в настройках расширения и **передаётся на сервер при старте imagine-операции**.
+  - Рекомендация: не писать ключ в `job.json`/`patches.json`; использовать только в памяти текущего thread-а.
+  - Как формат передачи: либо header `Authorization: Bearer <key>` на `POST /imagine/start`, либо поле `xai_api_key` в body.
+- Prompt: фиксированный дефолт + override из UI/Settings.
+
+---
+
+## 4) Вставка результатов в PSD (layers)
+
+Нужна новая ExtendScript функция в `scanr/app_src/host.js`, условно:
+- `applyImaginePatches({ groupName, belowGroupName, cleanedGroupName, patches: [{id, path, left, top}] })`
+
+Поведение:
+1) найти/создать группу `IMAGINE_PATCHES` (лучше внутри `CLEANED` и **над** `CLEANED_IMAGE`)
+2) для каждого patch:
+   - `tmpDoc = app.open(File(path))`, flatten/RGB
+   - duplicate layer в targetDoc
+   - назвать слой `id`
+   - translate так, чтобы layer.bounds.left/top == bbox.left/top
+   - move layer внутрь `IMAGINE_PATCHES`
+3) позиционирование группы относительно `BUBBLES_DETECTED`/`TRANSLATION` как у `applyCleanedPng` (патчи должны быть ниже синих прямоугольников и текста, чтобы они не пропали).
+
+Почему лучше ресайзить на сервере:
+- скрипт позиционирования проще (только translate, без scale/transform)
+- меньше ActionManager магии и багов на разных версиях Photoshop.
+
+---
+
+## 5) Что считать “готово” / acceptance checklist
+
+Минимальная версия:
+- пользователь может нарисовать квадраты в `IMAGINE_SQUARES`
+- кнопка запускает xAI edit по каждому ROI (job folder получает output_fit)
+- кнопка/автодействие вставляет output_fit в PSD как слои в папке над `CLEANED_IMAGE`
+- исходный `CLEANED_IMAGE` остаётся без изменений (патчи — overlay)
+
+Полезные улучшения:
+- overlay layer mask с мягкой границей 1–2px (уменьшает “швы”)
+- запись `imagine/patches.json` + `paths_open` (UNC) для удобного открытия результата из Windows
+- UI: прогресс “i/n”, cancel, retry failed items, prompt override
+
+---
+
+## 6) Где именно править (список файлов для следующего агента)
+
+Backend:
+- `tiper/server/schemas.py` (добавить Pydantic модели ImagineSquare/Request)
+- `tiper/server/jobs.py` (расширить `job_paths()` + optional `paths_open` для imagine outputs)
+- `tiper/server/app.py` (добавить endpoints + thread/task + прогресс)
+- (+) новый модуль: `tiper/server/xai_imagine.py` (обёртка над HTTP requests к xAI + decode/encode)
+
+Frontend (scanr):
+- `scanr/app_src/components/modal/autoTranslate.jsx` (новая кнопка/шаг)
+- `scanr/app_src/components/modal/settings.jsx` (новые настройки: toggle + key + prompt)
+- `scanr/app_src/context.jsx` (persist новых полей в `storeFields` + actions)
+- `scanr/app_src/utils.js` (новые `serverStartImagine`/`serverGetImagineStatus` + `applyImaginePatchesToActiveDoc`)
+- `scanr/app_src/host.js` (ExtendScript: `applyImaginePatches`, возможно helper “create/ensure group”)
+
+---
+
+## 7) Риски/неясности (сразу учесть)
+
+- Rate limits xAI: нужен backoff, ограничение параллельности, нормальные таймауты.
+- Качество стыка по границам ROI: возможно потребуется pad/crop strategy или маска.
+- Если PSD был масштабирован после старта job-а — координаты квадратов не совпадут с `cleaned.png`. Желательно проверять размеры документа vs job.image.
+- Формат ответа xAI: URL vs base64. Для надёжности лучше брать base64 и сохранять локально в job-dir.
