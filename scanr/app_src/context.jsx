@@ -35,6 +35,8 @@ const storeFields = [
   "multiBubbleMode",
   "internalPadding",
   "bubbleClassMap",
+  "xaiImagineEnabled",
+  "xaiImaginePrompt",
 ];
 
 const defaultShortcut = {
@@ -153,6 +155,8 @@ const initialState = {
   useAI: false,
   shortcut: { ...defaultShortcut, ...(storage.data?.shortcut || {}) },
   bubbleClassMap: storedBubbleClassMap,
+  xaiImagineEnabled: !!storage.data?.xaiImagineEnabled,
+  xaiImaginePrompt: storage.data?.xaiImaginePrompt || "",
 };
 
 const reducer = (state, action) => {
@@ -636,6 +640,16 @@ const reducer = (state, action) => {
 
     case "setUseAI": {
       newState.useAI = !!action.value;
+      break;
+    }
+
+    case "setXaiImagineEnabled": {
+      newState.xaiImagineEnabled = !!action.value;
+      break;
+    }
+
+    case "setXaiImaginePrompt": {
+      newState.xaiImaginePrompt = (action.value || "").toString();
       break;
     }
   }

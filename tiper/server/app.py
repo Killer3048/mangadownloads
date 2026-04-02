@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -14,10 +15,12 @@ from tiper.bubbles.detect import BubbleDetConfig, compute_smart_slice_boundaries
 from tiper.cutting.boxes import detect_text_boxes, detect_yolo_boxes
 from tiper.inpaint.pipeline import InpaintConfig, compute_cost_map_and_cuts, inpaint_with_bubbles_sliced, ocr_texts_per_bubble
 from tiper.server.ai_bubble import detect_request
+from tiper.server.keys import get_xai_api_key, get_xai_config
 from tiper.server.jobs import create_job, read_json, set_job_error, set_job_progress, set_job_status, update_job, write_json
-from tiper.server.paths import normalize_source_path
-from tiper.server.schemas import CreateJobRequest, SubmitBubblesRequest
+from tiper.server.paths import normalize_source_path, wsl_path_to_unc
+from tiper.server.schemas import CreateJobRequest, SubmitBubblesRequest, ImagineRequest
 from tiper.server.state import SharedResources
+from tiper.server.xai_imagine import XaiImagineError, imagine_edit_image, load_xai_imagine_config
 
 app = FastAPI(title="tiper server", version="1.0")
 app.add_middleware(
@@ -76,6 +79,27 @@ def _normalize_quotes(text: str) -> str:
   text = text.replace("‹", "'").replace("›", "'")  # Single guillemets
   
   return text
+
+
+def _safe_filename(name: str) -> str:
+  s = (name or "").strip()
+  if not s:
+    return "item"
+  s = re.sub(r"[^a-zA-Z0-9_.-]+", "_", s)
+  s = s.strip("._-")
+  return s or "item"
+
+
+def _imagine_dir(job_dir: Path) -> Path:
+  return job_dir / "imagine"
+
+
+def _read_imagine_status(job_dir: Path) -> Dict[str, Any]:
+  return read_json(_imagine_dir(job_dir) / "status.json")
+
+
+def _write_imagine_status(job_dir: Path, payload: Dict[str, Any]) -> None:
+  write_json(_imagine_dir(job_dir) / "status.json", payload)
 
 
 @app.get("/health")
@@ -373,6 +397,315 @@ def jobs_get_bubbles_final(job_id: str) -> Dict[str, Any]:
   return read_json(path)
 
 
+@app.post("/jobs/{job_id}/imagine")
+def jobs_imagine_start(job_id: str, req: ImagineRequest) -> Dict[str, Any]:
+  job_dir = _job_dir(job_id)
+  runtime = _RES.job_runtime(job_id)
+
+  squares: List[Dict[str, Any]] = []
+  for s in req.squares or []:
+    if hasattr(s, "model_dump"):  # pydantic v2
+      squares.append(s.model_dump())
+    else:  # pragma: no cover - pydantic v1
+      squares.append(s.dict())
+
+  if not squares:
+    raise HTTPException(status_code=400, detail="imagine_squares_empty")
+
+  xai_key = get_xai_api_key(_TIPER_ROOT)
+  if not xai_key:
+    raise HTTPException(
+      status_code=400,
+      detail={"error": "xai_api_key_missing", "hint": "Fill keys.yaml (xai.api_key) or set XAI_API_KEY env var."},
+    )
+
+  xai_cfg_raw = get_xai_config(_TIPER_ROOT)
+  default_prompt = str(xai_cfg_raw.get("default_prompt") or "").strip()
+  prompt = (
+    (req.prompt or "").strip()
+    or default_prompt
+    or "Remove ONLY text (dialogue inside bubbles, narration/captions, SFX text) and any watermark/logo/page-number/overlay text. Preserve everything else exactly: speech bubbles (outline + fill), panel borders/frames, line art, shading, textures, and background structures. If text overlaps existing art, reconstruct the original art underneath. Do NOT remove or alter bubbles or frames. Do NOT add new elements."
+  )
+
+  imagine_dir = _imagine_dir(job_dir)
+  if req.reset:
+    try:
+      shutil.rmtree(imagine_dir)
+    except Exception:
+      pass
+
+  imagine_dir.mkdir(parents=True, exist_ok=True)
+  (imagine_dir / "input").mkdir(parents=True, exist_ok=True)
+  (imagine_dir / "output_raw").mkdir(parents=True, exist_ok=True)
+  (imagine_dir / "output_fit").mkdir(parents=True, exist_ok=True)
+
+  with runtime.lock:
+    if runtime.imagine_task and runtime.imagine_task.is_alive():
+      return {"status": "imagine_running", "imagine": _read_imagine_status(job_dir)}
+
+    _write_imagine_status(
+      job_dir,
+      {
+        "schema_version": 1,
+        "status": "running",
+        "prompt": prompt,
+        "progress": {"done": 0, "total": len(squares), "pct": 0},
+        "items": [],
+        "last_error": None,
+      },
+    )
+
+    def _work():
+      try:
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from PIL import Image, ImageOps
+
+        cfg = load_xai_imagine_config(xai_cfg_raw, api_key=xai_key)
+
+        max_workers = 1
+        try:
+          max_workers = int(xai_cfg_raw.get("max_concurrency") or 1)
+        except Exception:
+          max_workers = 1
+        if max_workers < 1:
+          max_workers = 1
+        if max_workers > 8:
+          max_workers = 8
+
+        max_attempts = 1
+        try:
+          max_attempts = int(xai_cfg_raw.get("max_attempts") or xai_cfg_raw.get("max_tries") or 1)
+        except Exception:
+          max_attempts = 1
+        if max_attempts < 1:
+          max_attempts = 1
+        if max_attempts > 6:
+          max_attempts = 6
+
+        max_429_wait_sec = 300
+        try:
+          max_429_wait_sec = int(xai_cfg_raw.get("max_429_wait_sec") or 300)
+        except Exception:
+          max_429_wait_sec = 300
+        if max_429_wait_sec < 0:
+          max_429_wait_sec = 0
+        if max_429_wait_sec > 3600:
+          max_429_wait_sec = 3600
+
+        img = Image.open(job_dir / "original.png").convert("RGB")
+        doc_w, doc_h = img.size
+
+        items_out: List[Dict[str, Any]] = []
+        tasks: List[Dict[str, Any]] = []
+        total = len(squares)
+
+        # 1) Pre-crop inputs sequentially (avoids sharing a giant PIL image across threads).
+        for idx, s in enumerate(squares):
+          bb = (s.get("bbox") or {}) if isinstance(s, dict) else {}
+          left = int(float(bb.get("left", 0)))
+          top = int(float(bb.get("top", 0)))
+          right = int(float(bb.get("right", left)))
+          bottom = int(float(bb.get("bottom", top)))
+
+          left = max(0, min(left, doc_w - 1))
+          top = max(0, min(top, doc_h - 1))
+          right = max(left + 1, min(right, doc_w))
+          bottom = max(top + 1, min(bottom, doc_h))
+
+          roi_w = max(1, right - left)
+          roi_h = max(1, bottom - top)
+
+          raw_id = str(s.get("id") or f"R{idx+1:04d}")
+          safe_id = _safe_filename(raw_id)
+          if any(it.get("safe_id") == safe_id for it in items_out):
+            safe_id = f"{safe_id}_{idx+1:04d}"
+
+          in_path = imagine_dir / "input" / f"{safe_id}.png"
+          crop = img.crop((left, top, right, bottom))
+          crop.save(in_path)
+
+          item: Dict[str, Any] = {
+            "id": raw_id,
+            "safe_id": safe_id,
+            "bbox": {"left": left, "top": top, "right": right, "bottom": bottom},
+            "status": "pending",
+            "error": None,
+            "paths": {"input_png": str(in_path)},
+            "paths_open": {},
+          }
+          items_out.append(item)
+          tasks.append({"index": idx, "safe_id": safe_id, "in_path": in_path, "roi_w": roi_w, "roi_h": roi_h})
+
+        # Persist initial state (so UI can show items immediately).
+        _write_imagine_status(
+          job_dir,
+          {
+            "schema_version": 1,
+            "status": "running",
+            "prompt": prompt,
+            "progress": {"done": 0, "total": total, "pct": 0},
+            "items": items_out,
+            "last_error": None,
+          },
+        )
+        try:
+          write_json(imagine_dir / "patches.json", {"schema_version": 1, "items": items_out})
+        except Exception:
+          pass
+
+        def _process_one(task: Dict[str, Any]) -> Dict[str, Any]:
+          from PIL import Image as PILImage
+
+          idx = int(task["index"])
+          safe_id = str(task["safe_id"])
+          in_path = Path(task["in_path"])
+          roi_w = int(task["roi_w"])
+          roi_h = int(task["roi_h"])
+
+          with PILImage.open(in_path) as _im:
+            crop_img = _im.convert("RGB")
+
+          attempt = 0
+          backoff = 1.0
+          backoff_429 = 5.0
+          waited_429 = 0.0
+          while True:
+            attempt += 1
+            try:
+              out_img = imagine_edit_image(crop_img, prompt=prompt, cfg=cfg)
+              break
+            except XaiImagineError as e:
+              code = getattr(e, "status_code", None)
+              if code == 429 and max_429_wait_sec > 0:
+                ra = getattr(e, "retry_after_sec", None)
+                wait_s = float(ra) if ra is not None else backoff_429
+                if wait_s < 1.0:
+                  wait_s = 1.0
+                if wait_s > 120.0:
+                  wait_s = 120.0
+                if waited_429 + wait_s > float(max_429_wait_sec):
+                  raise
+                time.sleep(wait_s)
+                waited_429 += wait_s
+                backoff_429 = min(120.0, backoff_429 * 2.0)
+                continue
+
+              retriable = code in (500, 502, 503, 504)
+              if retriable and attempt < max_attempts:
+                time.sleep(backoff)
+                backoff = min(20.0, backoff * 2.0)
+                continue
+              raise
+            except Exception:
+              if attempt < max_attempts:
+                time.sleep(backoff)
+                backoff = min(20.0, backoff * 2.0)
+                continue
+              raise
+
+          raw_path = imagine_dir / "output_raw" / f"{safe_id}.png"
+          try:
+            out_img.convert("RGB").save(raw_path)
+          except Exception:
+            out_img.save(raw_path)
+
+          fit = ImageOps.fit(out_img.convert("RGB"), (roi_w, roi_h), method=Image.LANCZOS, centering=(0.5, 0.5))
+          fit_path = imagine_dir / "output_fit" / f"{safe_id}.png"
+          fit.save(fit_path)
+
+          return {
+            "index": idx,
+            "status": "ok",
+            "error": None,
+            "paths": {"output_raw_png": str(raw_path), "output_fit_png": str(fit_path)},
+            "paths_open": {"output_fit_png": wsl_path_to_unc(fit_path) or str(fit_path), "output_raw_png": wsl_path_to_unc(raw_path) or str(raw_path)},
+          }
+
+        # 2) Call xAI (optionally in parallel).
+        done = 0
+        if max_workers <= 1 or len(tasks) <= 1:
+          for task in tasks:
+            idx = int(task["index"])
+            items_out[idx]["status"] = "running"
+            try:
+              result = _process_one(task)
+              items_out[idx]["status"] = "ok"
+              items_out[idx]["paths"].update(result.get("paths") or {})
+              items_out[idx]["paths_open"] = result.get("paths_open") or {}
+            except XaiImagineError as e:
+              items_out[idx]["status"] = "error"
+              items_out[idx]["error"] = str(e)
+            except Exception as e:
+              items_out[idx]["status"] = "error"
+              items_out[idx]["error"] = f"imagine_failed: {e}"
+
+            done += 1
+            pct = int(max(0, min(100, round((done / float(total)) * 100)))) if total > 0 else 0
+            _write_imagine_status(job_dir, {"schema_version": 1, "status": "running", "prompt": prompt, "progress": {"done": done, "total": total, "pct": pct}, "items": items_out, "last_error": None})
+            try:
+              write_json(imagine_dir / "patches.json", {"schema_version": 1, "items": items_out})
+            except Exception:
+              pass
+        else:
+          with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_process_one, task): int(task["index"]) for task in tasks}
+            for fut in as_completed(futures):
+              idx = futures[fut]
+              try:
+                result = fut.result()
+                items_out[idx]["status"] = "ok"
+                items_out[idx]["paths"].update(result.get("paths") or {})
+                items_out[idx]["paths_open"] = result.get("paths_open") or {}
+              except XaiImagineError as e:
+                items_out[idx]["status"] = "error"
+                items_out[idx]["error"] = str(e)
+              except Exception as e:
+                items_out[idx]["status"] = "error"
+                items_out[idx]["error"] = f"imagine_failed: {e}"
+
+              done += 1
+              pct = int(max(0, min(100, round((done / float(total)) * 100)))) if total > 0 else 0
+              _write_imagine_status(job_dir, {"schema_version": 1, "status": "running", "prompt": prompt, "progress": {"done": done, "total": total, "pct": pct}, "items": items_out, "last_error": None})
+              try:
+                write_json(imagine_dir / "patches.json", {"schema_version": 1, "items": items_out})
+              except Exception:
+                pass
+
+        _write_imagine_status(job_dir, {"schema_version": 1, "status": "done", "prompt": prompt, "progress": {"done": done, "total": total, "pct": 100}, "items": items_out, "last_error": None})
+        try:
+          write_json(imagine_dir / "patches.json", {"schema_version": 1, "items": items_out})
+        except Exception:
+          pass
+      except Exception as e:
+        _write_imagine_status(
+          job_dir,
+          {
+            "schema_version": 1,
+            "status": "error",
+            "prompt": prompt,
+            "progress": {"done": 0, "total": len(squares), "pct": 0},
+            "items": [],
+            "last_error": str(e),
+          },
+        )
+
+    runtime.imagine_task = threading.Thread(target=_work, daemon=True)
+    runtime.imagine_task.start()
+
+  return {"status": "imagine_running"}
+
+
+@app.get("/jobs/{job_id}/imagine")
+def jobs_imagine_status(job_id: str) -> Dict[str, Any]:
+  job_dir = _job_dir(job_id)
+  status = _read_imagine_status(job_dir)
+  if not status:
+    return {"schema_version": 1, "status": "not_started"}
+  return status
+
+
 @app.post("/jobs/{job_id}/run_ocr_clean")
 def jobs_run_ocr_clean(job_id: str) -> Dict[str, Any]:
   job_dir = _job_dir(job_id)
@@ -407,7 +740,7 @@ def jobs_run_ocr_clean(job_id: str) -> Dict[str, Any]:
 
         img = Image.open(job_dir / "original.png").convert("RGB")
 
-        # SmartSlicer cuts are shared across OCR + inpaint + frames.
+        # SmartSlicer cuts are shared across OCR + inpaint.
         weights = slicing_cfg.get("weights") or {}
         cfg_inpaint = InpaintConfig(
           min_h=int(slicing_cfg.get("min_h", _RES.default_config["slicing"]["min_h"])),
@@ -602,24 +935,6 @@ def jobs_run_ocr_clean(job_id: str) -> Dict[str, Any]:
             write_json(job_dir / "text_styles.json", {"styles": styles})
           except Exception:
             # Style extraction is optional; don't fail the job.
-            pass
-
-        # Optional frames slicing
-        frames_cfg = (job.get("config") or {}).get("frames") or {}
-        if frames_cfg.get("enabled", False):
-          try:
-            from tiper.frames_slicer import FramesSlicer
-
-            frames_slicer = FramesSlicer({"frames": frames_cfg})
-            frames_slicer.slice_frames(
-              image=cleaned,
-              chapter_folder=job_dir,
-              cost_map=cost_map,
-              boxes=[(b["bbox"]["left"], b["bbox"]["top"], b["bbox"]["right"], b["bbox"]["bottom"], 1.0, 0) for b in bubbles],
-              margin=int(slicing_cfg.get("margin", 20)),
-            )
-          except Exception:
-            # Frames are optional; don't fail the job.
             pass
 
         update_job(job_dir, {"status": "await_translation"})

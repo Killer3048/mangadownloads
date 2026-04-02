@@ -35,6 +35,10 @@ yarn-error.log*
 .env.*
 !.env.example
 
+# Local API keys (do not commit)
+keys.yaml
+keys.yml
+
 # Runtime outputs
 tiper/jobs/
 tiper/output/

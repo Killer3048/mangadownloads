@@ -63,6 +63,9 @@ def job_paths(job_dir: Path) -> Dict[str, str]:
     "ocr_mask_stats": str(job_dir / "ocr_mask_stats.json"),
     "translation_fit": str(job_dir / "translation_fit.json"),
     "frames_dir": str(job_dir / "frames"),
+    "imagine_dir": str(job_dir / "imagine"),
+    "imagine_status": str(job_dir / "imagine" / "status.json"),
+    "imagine_patches": str(job_dir / "imagine" / "patches.json"),
   }
 
 

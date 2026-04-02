@@ -1,0 +1,14 @@
+# Copy to keys.yaml and fill in secrets (keys.yaml is gitignored).
+xai:
+  api_key: ""
+  base_url: "https://api.x.ai/v1"
+  model_image: "grok-imagine-image"
+  # Prompt tuned for comics cleanup: remove only unwanted overlays and preserve line-art.
+  default_prompt: "Remove ONLY text (dialogue inside bubbles, narration/captions, SFX text) and any watermark/logo/page-number/overlay text. Preserve everything else exactly: speech bubbles (outline + fill), panel borders/frames, line art, shading, textures, and background structures. If text overlaps existing art, reconstruct the original art underneath. Do NOT remove or alter bubbles or frames. Do NOT add new elements."
+  # How many ROI requests can run in parallel (be careful with rate limits).
+  max_concurrency: 1
+  # Maximum attempts per ROI request (keep 1 to avoid accidental extra charges).
+  max_attempts: 1
+  # How long to keep retrying on 429 (high demand / rate limit) before failing the ROI.
+  max_429_wait_sec: 300
+  timeout_sec: 120

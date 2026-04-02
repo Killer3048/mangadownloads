@@ -212,6 +212,7 @@ def default_job_config(tiper_root: Path) -> Dict[str, Any]:
 class JobRuntime:
   detect_task: Optional[Any] = None
   ocr_task: Optional[Any] = None
+  imagine_task: Optional[Any] = None
   lock: threading.Lock = field(default_factory=threading.Lock)
 
 

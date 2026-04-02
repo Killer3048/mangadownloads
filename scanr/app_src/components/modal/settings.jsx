@@ -49,6 +49,8 @@ const SettingsModal = React.memo(function SettingsModal() {
   const [bubbleClassMap, setBubbleClassMap] = React.useState(
     normalizeBubbleClassMap(context.state.bubbleClassMap)
   );
+  const [xaiImagineEnabled, setXaiImagineEnabled] = React.useState(!!context.state.xaiImagineEnabled);
+  const [xaiImaginePrompt, setXaiImaginePrompt] = React.useState(context.state.xaiImaginePrompt || "");
   const [edited, setEdited] = React.useState(false);
 
   const fonts = getUserFonts();
@@ -108,6 +110,16 @@ const SettingsModal = React.memo(function SettingsModal() {
 
   const changeBubbleReadingOrder = (e) => {
     setBubbleReadingOrder(e.target.value);
+    setEdited(true);
+  };
+
+  const changeXaiImagineEnabled = (e) => {
+    setXaiImagineEnabled(e.target.checked);
+    setEdited(true);
+  };
+
+  const changeXaiImaginePrompt = (e) => {
+    setXaiImaginePrompt(e.target.value);
     setEdited(true);
   };
 
@@ -318,6 +330,18 @@ const SettingsModal = React.memo(function SettingsModal() {
       context.dispatch({
         type: "setBubbleClassMap",
         value: bubbleClassMap,
+      });
+    }
+    if (xaiImagineEnabled !== !!context.state.xaiImagineEnabled) {
+      context.dispatch({
+        type: "setXaiImagineEnabled",
+        value: xaiImagineEnabled,
+      });
+    }
+    if (xaiImaginePrompt !== (context.state.xaiImaginePrompt || "")) {
+      context.dispatch({
+        type: "setXaiImaginePrompt",
+        value: xaiImaginePrompt,
       });
     }
     const shortcut = {};
@@ -721,23 +745,50 @@ const SettingsModal = React.memo(function SettingsModal() {
                 <div className="field-descr">{locale.settingsInternalPaddingHint || "Espace interne pour éviter que le texte touche les bords de la bulle (0-100 pixels)"}</div>
               </div>
             </div>
-            <div className="settings-group">
-              <div className="settings-group-title">{locale.settingsGroupAutoTranslate || "Auto Translate"}</div>
-              <div className="field">
-                <div className="field-label">{locale.settingsBubbleReadingOrderLabel || "Bubble reading order"}</div>
-                <div className="field-input">
-                  <select value={bubbleReadingOrder} onChange={changeBubbleReadingOrder} className="topcoat-textarea">
-                    <option value="ltr">{locale.settingsBubbleReadingOrderLtr || locale.settingsDirectionLtr || "Left to Right"}</option>
-                    <option value="rtl">{locale.settingsBubbleReadingOrderRtl || locale.settingsDirectionRtl || "Right to Left"}</option>
-                  </select>
-                </div>
-                <div className="field-descr">{locale.settingsBubbleReadingOrderHint || "Used for Auto Translate → Finalize / Renumber."}</div>
-              </div>
-            </div>
-            <div className="settings-group">
-              <div className="settings-group-title">{locale.settingsGroupBubbleFonts || "Auto-Translate bubble fonts"}</div>
-              <div className="bubble-class-map">
-                {BUBBLE_CLASSES.map((cls) => {
+	            <div className="settings-group">
+	              <div className="settings-group-title">{locale.settingsGroupAutoTranslate || "Auto Translate"}</div>
+	              <div className="field">
+	                <div className="field-label">{locale.settingsBubbleReadingOrderLabel || "Bubble reading order"}</div>
+	                <div className="field-input">
+	                  <select value={bubbleReadingOrder} onChange={changeBubbleReadingOrder} className="topcoat-textarea">
+	                    <option value="ltr">{locale.settingsBubbleReadingOrderLtr || locale.settingsDirectionLtr || "Left to Right"}</option>
+	                    <option value="rtl">{locale.settingsBubbleReadingOrderRtl || locale.settingsDirectionRtl || "Right to Left"}</option>
+	                  </select>
+	                </div>
+	                <div className="field-descr">{locale.settingsBubbleReadingOrderHint || "Used for Auto Translate → Finalize / Renumber."}</div>
+	              </div>
+	            </div>
+	            <div className="settings-group">
+	              <div className="settings-group-title">{locale.settingsGroupXaiImagine || "xAI Imagine"}</div>
+	              <div className="settings-checkbox-grid">
+	                <div className="settings-checkbox-item">
+	                  <label className="settings-checkbox-label">
+	                    <input type="checkbox" checked={xaiImagineEnabled} onChange={changeXaiImagineEnabled} />
+	                    <div className="settings-checkbox-custom"></div>
+	                    <div className="settings-checkbox-content">
+	                      <span>{locale.settingsXaiImagineEnabledLabel || "Enable xAI Imagine step"}</span>
+	                      <div className="settings-checkbox-hint">
+	                        {locale.settingsXaiImagineEnabledHint ||
+	                          "Adds an optional Auto Translate step that sends red squares (IMAGINE_SQUARES) to xAI for cleanup. Requires keys.yaml (xai.api_key)."}
+	                      </div>
+	                    </div>
+	                  </label>
+	                </div>
+	              </div>
+	              <div className="field">
+	                <div className="field-label">{locale.settingsXaiImaginePromptLabel || "Default prompt"}</div>
+	                <div className="field-input">
+	                  <textarea rows={3} value={xaiImaginePrompt} onChange={changeXaiImaginePrompt} className="topcoat-textarea" />
+	                </div>
+	                <div className="field-descr">
+	                  {locale.settingsXaiImaginePromptHint || "Used for Auto Translate → xAI Imagine (can be overridden in the modal later)."}
+	                </div>
+	              </div>
+	            </div>
+	            <div className="settings-group">
+	              <div className="settings-group-title">{locale.settingsGroupBubbleFonts || "Auto-Translate bubble fonts"}</div>
+	              <div className="bubble-class-map">
+	                {BUBBLE_CLASSES.map((cls) => {
                   const entry = bubbleClassMap?.[cls.id] || {};
                   const family = entry.fontFamily || entry.fontName || "";
                   const families = fontFamilies.slice();

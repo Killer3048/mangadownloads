@@ -27,3 +27,13 @@ class Bubble(BaseModel):
 class SubmitBubblesRequest(BaseModel):
   bubbles: List[Bubble]
 
+
+class ImagineSquare(BaseModel):
+  id: str
+  bbox: BubbleBBox
+
+
+class ImagineRequest(BaseModel):
+  squares: List[ImagineSquare]
+  prompt: Optional[str] = Field(None, description="Prompt override for xAI imagine.")
+  reset: Optional[bool] = Field(False, description="If true, clears previous imagine outputs for this job.")

@@ -846,6 +846,23 @@ const applyCleanedPngToActiveDoc = async ({
   return res;
 };
 
+const applyImaginePatchesToActiveDoc = async ({
+  patches = [],
+  groupName = "IMAGINE_PATCHES",
+  cleanedGroupName = "CLEANED",
+  cleanedImageLayerName = "CLEANED_IMAGE",
+  belowGroupName = "BUBBLES_DETECTED",
+  translationGroupName = "TRANSLATION",
+  replaceExisting = true,
+} = {}) => {
+  const payload = { patches, groupName, cleanedGroupName, cleanedImageLayerName, belowGroupName, translationGroupName, replaceExisting };
+  const res = await _evalScriptJSON(`applyImaginePatches(${JSON.stringify(payload)})`);
+  if (!res || res.error) {
+    throw new Error(res?.detail || res?.error || "applyImaginePatches");
+  }
+  return res;
+};
+
 const openFolderPath = (folderPath) => {
   csInterface.evalScript(`openFolder(${JSON.stringify(folderPath || "")})`);
 };
@@ -920,6 +937,22 @@ const serverGetTranslations = async (jobId, payload = {}, { signal } = {}) => {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {}),
+    signal,
+  });
+};
+
+const serverStartImagine = async (jobId, payload = {}, { signal } = {}) => {
+  return _serverFetchJson(`${TIPER_SERVER_URL}/jobs/${encodeURIComponent(jobId)}/imagine`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+    signal,
+  });
+};
+
+const serverGetImagine = async (jobId, { signal } = {}) => {
+  return _serverFetchJson(`${TIPER_SERVER_URL}/jobs/${encodeURIComponent(jobId)}/imagine`, {
+    method: "GET",
     signal,
   });
 };
@@ -1194,4 +1227,4 @@ const openFile = (path, autoClose = false) => {
   );
 };
 
-export { csInterface, locale, openUrl, readStorage, writeToStorage, deleteStorageFile, nativeAlert, nativeConfirm, getUserFonts, getActiveLayerText, setActiveLayerText, getCurrentSelection, getSelectionBoundsHash, startSelectionMonitoring, stopSelectionMonitoring, getSelectionChanged, createTextLayerInSelection, createTextLayersInStoredSelections, alignTextLayerToSelection, alignTextLayerToBubbleAI, fixTrailingSpacesInActiveLayer, aiLoadBubbleModel, aiUnloadBubbleModel, exportActiveDocFlattenPng, createBubbleRectanglesGroup, readBubbleRectanglesGroup, renumberBubbleRectanglesGroup, createTranslatedTextLayers, applyCleanedPngToActiveDoc, openFolderPath, serverCreateJob, serverStartDetectBubbles, serverGetJob, serverGetBubblesAuto, serverSubmitBubbles, serverStartOcrClean, serverGetTranslations, changeActiveLayerTextSize, getHotkeyPressed, resizeTextArea, scrollToLine, scrollToStyle, rgbToHex, getStyleObject, getDefaultStyle, getDefaultStroke, openFile, checkUpdate, downloadAndInstallUpdate };
+export { csInterface, locale, openUrl, readStorage, writeToStorage, deleteStorageFile, nativeAlert, nativeConfirm, getUserFonts, getActiveLayerText, setActiveLayerText, getCurrentSelection, getSelectionBoundsHash, startSelectionMonitoring, stopSelectionMonitoring, getSelectionChanged, createTextLayerInSelection, createTextLayersInStoredSelections, alignTextLayerToSelection, alignTextLayerToBubbleAI, fixTrailingSpacesInActiveLayer, aiLoadBubbleModel, aiUnloadBubbleModel, exportActiveDocFlattenPng, createBubbleRectanglesGroup, readBubbleRectanglesGroup, renumberBubbleRectanglesGroup, createTranslatedTextLayers, applyCleanedPngToActiveDoc, applyImaginePatchesToActiveDoc, openFolderPath, serverCreateJob, serverStartDetectBubbles, serverGetJob, serverGetBubblesAuto, serverSubmitBubbles, serverStartOcrClean, serverGetTranslations, serverStartImagine, serverGetImagine, changeActiveLayerTextSize, getHotkeyPressed, resizeTextArea, scrollToLine, scrollToStyle, rgbToHex, getStyleObject, getDefaultStyle, getDefaultStroke, openFile, checkUpdate, downloadAndInstallUpdate };

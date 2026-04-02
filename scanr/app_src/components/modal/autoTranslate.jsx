@@ -6,9 +6,11 @@ import {
   nativeAlert,
   exportActiveDocFlattenPng,
   createBubbleRectanglesGroup,
+  readBubbleRectanglesGroup,
   renumberBubbleRectanglesGroup,
   createTranslatedTextLayers,
   applyCleanedPngToActiveDoc,
+  applyImaginePatchesToActiveDoc,
   openFolderPath,
   serverCreateJob,
   serverStartDetectBubbles,
@@ -16,6 +18,8 @@ import {
   serverGetBubblesAuto,
   serverSubmitBubbles,
   serverStartOcrClean,
+  serverStartImagine,
+  serverGetImagine,
   serverGetTranslations,
 } from "../../utils";
 import { useContext } from "../../context";
@@ -23,6 +27,8 @@ import { DEFAULT_BUBBLE_CLASS_CONFIDENCE, normalizeBubbleClassMap } from "../../
 
 const GROUP_BUBBLES = "BUBBLES_DETECTED";
 const GROUP_TRANSLATION = "TRANSLATION";
+const GROUP_IMAGINE_SQUARES = "IMAGINE_SQUARES";
+const GROUP_IMAGINE_PATCHES = "IMAGINE_PATCHES";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -169,6 +175,37 @@ const AutoTranslateModal = React.memo(function AutoTranslateModal() {
     }
   };
 
+  const pollImagineUntil = async (
+    jobId,
+    predicate,
+    { intervalMs = 1000, timeoutMs = 30 * 60 * 1000, stallTimeoutMs = 30 * 60 * 1000 } = {}
+  ) => {
+    const started = Date.now();
+    let lastSig = null;
+    let lastAt = Date.now();
+    while (true) {
+      throwIfCancelled();
+      const data = await serverGetImagine(jobId, { signal: abortRef.current ? abortRef.current.signal : undefined });
+      if (predicate(data)) return data;
+
+      const prog = data?.progress || {};
+      const sig = [data?.status || "", prog?.done || 0, prog?.total || 0, prog?.pct || 0].join("|");
+      if (sig !== lastSig) {
+        lastSig = sig;
+        lastAt = Date.now();
+      }
+
+      const now = Date.now();
+      if (timeoutMs != null && now - started > timeoutMs) {
+        throw new Error("Timeout while waiting for xAI imagine.");
+      }
+      if (stallTimeoutMs != null && now - lastAt > stallTimeoutMs) {
+        throw new Error("Timeout while waiting for xAI imagine.");
+      }
+      await sleep(intervalMs);
+    }
+  };
+
   const detectBubbles = async () => {
     if (busyRef.current) return;
     busyRef.current = true;
@@ -303,6 +340,115 @@ const AutoTranslateModal = React.memo(function AutoTranslateModal() {
     }
   };
 
+  const runXaiImagine = async () => {
+    if (!job?.job_id) return;
+    if (busyRef.current) return;
+    if (!context.state.xaiImagineEnabled) {
+      nativeAlert(
+        locale.autoTranslateImagineDisabled || "xAI Imagine is disabled. Enable it in Settings → xAI Imagine.",
+        locale.errorTitle,
+        true
+      );
+      return;
+    }
+
+    busyRef.current = true;
+    cancelRef.current = false;
+    abortRef.current = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const signal = abortRef.current ? abortRef.current.signal : undefined;
+
+    safeSetBusy(true);
+    safeSetStatusText(locale.autoTranslateImagineReadSquares || "Reading IMAGINE_SQUARES...");
+    try {
+      throwIfCancelled();
+      const rects = await readBubbleRectanglesGroup(GROUP_IMAGINE_SQUARES);
+      if (!rects || !rects.length) {
+        nativeAlert(
+          locale.autoTranslateImagineNoSquares ||
+            `No squares found. Create a group named ${GROUP_IMAGINE_SQUARES} and draw red stroke-only squares.`,
+          locale.errorTitle,
+          true
+        );
+        return;
+      }
+
+      const tol = 2;
+      const bad = [];
+      const squares = [];
+      for (let i = 0; i < rects.length; i++) {
+        const r = rects[i] || {};
+        const left = Math.round(Number(r.left) || 0);
+        const top = Math.round(Number(r.top) || 0);
+        const right = Math.round(Number(r.right) || left + 1);
+        const bottom = Math.round(Number(r.bottom) || top + 1);
+        const w = Math.max(1, right - left);
+        const h = Math.max(1, bottom - top);
+        const name = (r.name || "").toString().trim() || `R${String(i + 1).padStart(4, "0")}`;
+        if (Math.abs(w - h) > tol) bad.push({ name, w, h });
+        squares.push({ id: name, bbox: { left, top, right, bottom } });
+      }
+      if (bad.length) {
+        const first = bad.slice(0, 6).map((b) => `${b.name} (${b.w}x${b.h})`).join("\n");
+        nativeAlert(
+          (locale.autoTranslateImagineNotSquares || "Some shapes are not squares. Please draw squares only.") +
+            "\n\n" +
+            first,
+          locale.errorTitle,
+          true
+        );
+        return;
+      }
+
+      const prompt = (context.state.xaiImaginePrompt || "").toString().trim() || undefined;
+      safeSetStatusText(locale.autoTranslateImagineStart || "Starting xAI imagine...");
+      await serverStartImagine(job.job_id, { squares, prompt, reset: true }, { signal });
+
+      safeSetStatusText(locale.autoTranslateImagineRunning || "xAI imagine running...");
+      const done = await pollImagineUntil(job.job_id, (d) => d?.status === "done" || d?.status === "error");
+      if (done?.status === "error") {
+        throw new Error(done?.last_error || "xAI imagine failed");
+      }
+
+      const items = done?.items || [];
+      const okItems = (items || []).filter((it) => it?.status === "ok" && it?.paths_open?.output_fit_png && it?.bbox);
+      if (!okItems.length) {
+        const firstErr = (items || []).find((it) => it?.status === "error" && it?.error)?.error;
+        nativeAlert(
+          (locale.autoTranslateImagineNoResults || "xAI imagine produced no usable results.") + (firstErr ? `\n\n${firstErr}` : ""),
+          locale.errorTitle,
+          true
+        );
+        return;
+      }
+
+      safeSetStatusText(locale.autoTranslateImagineApply || "Applying patches into Photoshop...");
+      await applyImaginePatchesToActiveDoc({
+        patches: okItems.map((it) => ({
+          id: it.id,
+          path: it.paths_open.output_fit_png,
+          left: it.bbox.left,
+          top: it.bbox.top,
+        })),
+        groupName: GROUP_IMAGINE_PATCHES,
+        cleanedGroupName: "CLEANED",
+        cleanedImageLayerName: "CLEANED_IMAGE",
+        belowGroupName: GROUP_BUBBLES,
+        translationGroupName: GROUP_TRANSLATION,
+        replaceExisting: true,
+      });
+
+      safeSetStatusText(locale.autoTranslateImagineDone || "xAI Imagine done.");
+    } catch (e) {
+      if (!isCancelledError(e)) {
+        nativeAlert((locale.autoTranslateError || "Auto Translate failed.") + "\n\n" + (e?.message || e), locale.errorTitle, true);
+      }
+    } finally {
+      abortRef.current = null;
+      busyRef.current = false;
+      safeSetBusy(false);
+    }
+  };
+
   const openJobFolder = () => {
     const jobDir = job?.paths_open?.job_dir || job?.paths?.job_dir;
     if (jobDir) openFolderPath(jobDir);
@@ -394,12 +540,25 @@ const AutoTranslateModal = React.memo(function AutoTranslateModal() {
             <button className="topcoat-button--large--cta" onClick={runOcrClean} disabled={busy || !job?.job_id}>
               {locale.autoTranslateOcrClean || "3) Extract original + Clean"}
             </button>
-            <div className="field-descr">{locale.autoTranslateOcrCleanDescr || "Generates original.txt, cleaned.png and frames/ (if enabled)."} </div>
+            <div className="field-descr">{locale.autoTranslateOcrCleanDescr || "Generates original.txt and cleaned.png."} </div>
+          </div>
+
+          <div className="field hostBrdTopContrast">
+            <button className="topcoat-button--large--cta" onClick={runXaiImagine} disabled={busy || !job?.job_id || !context.state.xaiImagineEnabled}>
+              {locale.autoTranslateImagine || "4) xAI Imagine (red squares)"}
+            </button>
+            <div className="field-descr">
+              {context.state.xaiImagineEnabled
+                ? locale.autoTranslateImagineDescr ||
+                  `Reads ${GROUP_IMAGINE_SQUARES} rectangles and inserts results into ${GROUP_IMAGINE_PATCHES} group.`
+                : locale.autoTranslateImagineDisabledHint ||
+                  "Enable in Settings → xAI Imagine (requires keys.yaml with xai.api_key)."}
+            </div>
           </div>
 
           <div className="field hostBrdTopContrast">
             <button className="topcoat-button--large--cta" onClick={applyTranslation} disabled={busy || !job?.job_id || !bubblesFinal.length}>
-              {locale.autoTranslateApply || "4) Apply translation"}
+              {locale.autoTranslateApply || "5) Apply translation"}
             </button>
             <div className="field-descr">{locale.autoTranslateApplyDescr || `Reads translate.txt from the job folder and creates ${GROUP_TRANSLATION} text layers.`}</div>
           </div>

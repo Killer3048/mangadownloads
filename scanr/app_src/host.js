@@ -71,6 +71,10 @@ var _hostState = {
     data: null,
     result: "",
   },
+  applyImaginePatches: {
+    data: null,
+    result: "",
+  },
   setActiveLayerText: {
     data: null,
     result: "",
@@ -1775,8 +1779,13 @@ function _unitToPx(v) {
   return Number(v) || 0;
 }
 
-function _getLayerBoundsPx(layer) {
+function _getLayerBoundsPx(layer, useNoEffects) {
   var b = layer.bounds;
+  if (useNoEffects) {
+    try {
+      if (layer.boundsNoEffects) b = layer.boundsNoEffects;
+    } catch (eNoEff) { }
+  }
   var left = _unitToPx(b[0]);
   var top = _unitToPx(b[1]);
   var right = _unitToPx(b[2]);
@@ -1878,6 +1887,18 @@ function _createBubbleRectangles() {
     var group = doc.layerSets.add();
     group.name = groupName;
 
+    // Convenience: ensure manual ROI group exists for xAI imagine step.
+    // Do NOT delete if it already exists (user drawings must persist across re-detect).
+    var imagineSquares = _findLayerSetByName(doc, "IMAGINE_SQUARES");
+    if (!imagineSquares) {
+      imagineSquares = doc.layerSets.add();
+      imagineSquares.name = "IMAGINE_SQUARES";
+      try {
+        // Keep it above the bubbles group so it's easy to draw on top.
+        imagineSquares.move(group, ElementPlacement.PLACEBEFORE);
+      } catch (eMoveImagine) { }
+    }
+
     for (var i = 0; i < bubbles.length; i++) {
       var b = bubbles[i] || {};
       var bb = b.bbox || {};
@@ -1942,6 +1963,8 @@ function getRectanglesFromGroup(data) {
     return jamJSON.stringify({ error: "doc" });
   }
   var groupName = (data && data.groupName) || "BUBBLES_DETECTED";
+  var useNoEffects = !!(data && data.useNoEffects);
+  if (groupName === "IMAGINE_SQUARES") useNoEffects = true;
   var startUnits = app.preferences.rulerUnits;
   try {
     app.preferences.rulerUnits = Units.PIXELS;
@@ -1955,7 +1978,7 @@ function getRectanglesFromGroup(data) {
     var out = [];
     for (var i = 0; i < layers.length; i++) {
       var layer = layers[i];
-      var b = _getLayerBoundsPx(layer);
+      var b = _getLayerBoundsPx(layer, useNoEffects);
       out.push({
         name: layer.name,
         left: b.left,
@@ -2459,6 +2482,155 @@ function applyCleanedPng(data) {
   state.data = data;
   state.result = "";
   app.activeDocument.suspendHistory("TypeR Auto Translate: Apply Cleaned Image", "_applyCleanedPng()");
+  return state.result;
+}
+
+function _findArtLayerByName(parent, name) {
+  if (!parent || !name) return null;
+  var layers = parent.artLayers || [];
+  for (var i = 0; i < layers.length; i++) {
+    var layer = layers[i];
+    if (layer && layer.name === name) return layer;
+  }
+  var sets = parent.layerSets || [];
+  for (var j = 0; j < sets.length; j++) {
+    var inner = _findArtLayerByName(sets[j], name);
+    if (inner) return inner;
+  }
+  return null;
+}
+
+function _applyImaginePatches() {
+  var state = _hostState.applyImaginePatches;
+  if (!documents.length) {
+    state.result = jamJSON.stringify({ error: "doc" });
+    return;
+  }
+
+  var data = state.data || {};
+  var patches = data.patches || [];
+  if (!patches.length) {
+    state.result = jamJSON.stringify({ error: "patches" });
+    return;
+  }
+
+  var groupName = data.groupName || "IMAGINE_PATCHES";
+  var cleanedGroupName = data.cleanedGroupName || "CLEANED";
+  var cleanedImageLayerName = data.cleanedImageLayerName || "CLEANED_IMAGE";
+  var belowGroupName = data.belowGroupName || "BUBBLES_DETECTED";
+  var translationGroupName = data.translationGroupName || "TRANSLATION";
+  var replaceExisting = data.replaceExisting !== false;
+
+  var startUnits = app.preferences.rulerUnits;
+  var tmpDoc = null;
+  try {
+    app.preferences.rulerUnits = Units.PIXELS;
+
+    var targetDoc = app.activeDocument;
+    var cleanedGroup = _findLayerSetByName(targetDoc, cleanedGroupName);
+
+    // Remove existing patches group (either under CLEANED or at top-level).
+    if (replaceExisting) {
+      var existing = cleanedGroup ? _findLayerSetByName(cleanedGroup, groupName) : _findLayerSetByName(targetDoc, groupName);
+      if (existing) {
+        try {
+          existing.remove();
+        } catch (eRemove) { }
+      }
+    }
+
+    var group = null;
+    if (cleanedGroup) {
+      group = cleanedGroup.layerSets.add();
+      group.name = groupName;
+      // Ensure it's above the CLEANED_IMAGE layer when present.
+      var cleanedLayer = _findArtLayerByName(cleanedGroup, cleanedImageLayerName);
+      if (cleanedLayer) {
+        try {
+          group.move(cleanedLayer, ElementPlacement.PLACEBEFORE);
+        } catch (eMoveGroup) { }
+      }
+    } else {
+      group = targetDoc.layerSets.add();
+      group.name = groupName;
+      // Place below BUBBLES/TRANSLATION so overlays remain visible.
+      var below = _findLayerSetByName(targetDoc, belowGroupName);
+      if (!below) below = _findLayerSetByName(targetDoc, translationGroupName);
+      if (below) {
+        _moveLayerBelow(targetDoc, group, below);
+      }
+    }
+
+    var applied = 0;
+    for (var i = 0; i < patches.length; i++) {
+      var p = patches[i] || {};
+      var filePath = p.path || p.file || "";
+      var left = Number(p.left);
+      var top = Number(p.top);
+      if (!filePath || isNaN(left) || isNaN(top)) continue;
+
+      var file = new File(filePath);
+      if (!file.exists) continue;
+
+      tmpDoc = app.open(file);
+      try {
+        tmpDoc.changeMode(ChangeMode.RGB);
+      } catch (eMode) { }
+      try {
+        tmpDoc.flatten();
+      } catch (eFlat) { }
+
+      var layerToDup = tmpDoc.activeLayer;
+      var dupLayer = null;
+      try {
+        dupLayer = layerToDup.duplicate(targetDoc, ElementPlacement.PLACEATBEGINNING);
+      } catch (eDup) {
+        dupLayer = layerToDup.duplicate(targetDoc);
+      }
+
+      try {
+        tmpDoc.close(SaveOptions.DONOTSAVECHANGES);
+      } catch (eClose) { }
+      tmpDoc = null;
+
+      app.activeDocument = targetDoc;
+      try {
+        dupLayer.name = p.id || ("PATCH_" + _padNum(i + 1, 4));
+      } catch (eName) { }
+
+      // Position by bbox top-left (server already resized the patch to ROI size).
+      try {
+        var b = _getLayerBoundsPx(dupLayer);
+        dupLayer.translate(left - b.left, top - b.top);
+      } catch (ePos) { }
+
+      try {
+        dupLayer.move(group, ElementPlacement.INSIDE);
+      } catch (eMove) { }
+      applied++;
+    }
+
+    state.result = jamJSON.stringify({ ok: true, count: applied, groupName: groupName });
+  } catch (e) {
+    state.result = jamJSON.stringify({ error: "apply_imagine", detail: "" + e });
+  } finally {
+    try {
+      if (tmpDoc) tmpDoc.close(SaveOptions.DONOTSAVECHANGES);
+    } catch (eClose2) { }
+    try {
+      app.preferences.rulerUnits = startUnits;
+    } catch (e2) { }
+  }
+}
+
+function applyImaginePatches(data) {
+  if (!documents.length) {
+    return jamJSON.stringify({ error: "doc" });
+  }
+  var state = _hostState.applyImaginePatches;
+  state.data = data;
+  state.result = "";
+  app.activeDocument.suspendHistory("TypeR Auto Translate: Apply Imagine Patches", "_applyImaginePatches()");
   return state.result;
 }
 
